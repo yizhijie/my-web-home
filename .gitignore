@@ -1,0 +1,7 @@
+# Secrets and runtime state must never be committed or deployed from GitHub.
+.env
+data/
+backups/
+__pycache__/
+*.py[cod]
+.DS_Store
