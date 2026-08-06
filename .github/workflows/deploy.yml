@@ -14,7 +14,8 @@ permissions:
 
 jobs:
   deploy:
-    runs-on: ubuntu-latest
+    # This runner lives on the ECS itself. No public SSH access is required.
+    runs-on: [self-hosted, Linux, X64]
     environment: production
     steps:
       - name: Check out source
@@ -30,30 +31,12 @@ jobs:
             --exclude='backups' \
             -czf /tmp/trend-radar-release.tar.gz .
 
-      - name: Configure SSH
-        env:
-          ECS_SSH_KEY: ${{ secrets.ECS_SSH_KEY }}
-          ECS_HOST: ${{ secrets.ECS_HOST }}
-        run: |
-          install -m 700 -d ~/.ssh
-          printf '%s' "$ECS_SSH_KEY" > ~/.ssh/id_ed25519
-          chmod 600 ~/.ssh/id_ed25519
-          ssh-keyscan -H "$ECS_HOST" >> ~/.ssh/known_hosts
-
-      - name: Upload release
-        env:
-          ECS_HOST: ${{ secrets.ECS_HOST }}
-          ECS_USER: ${{ secrets.ECS_USER }}
-          ECS_PORT: ${{ secrets.ECS_PORT }}
-        run: |
-          scp -P "${ECS_PORT:-22}" /tmp/trend-radar-release.tar.gz \
-            "$ECS_USER@$ECS_HOST:/tmp/trend-radar-release.tar.gz"
-
       - name: Deploy and verify
-        env:
-          ECS_HOST: ${{ secrets.ECS_HOST }}
-          ECS_USER: ${{ secrets.ECS_USER }}
-          ECS_PORT: ${{ secrets.ECS_PORT }}
         run: |
-          ssh -p "${ECS_PORT:-22}" "$ECS_USER@$ECS_HOST" \
-            'set -eu; mkdir -p /opt/trend-radar; tar -xzf /tmp/trend-radar-release.tar.gz -C /opt/trend-radar; cd /opt/trend-radar; test -f .env; docker compose up -d --build; curl -fsS http://127.0.0.1:8080/health'
+          set -eu
+          mkdir -p /opt/trend-radar
+          tar -xzf /tmp/trend-radar-release.tar.gz -C /opt/trend-radar
+          cd /opt/trend-radar
+          test -f .env
+          docker compose up -d --build
+          curl -fsS http://127.0.0.1:8080/health
