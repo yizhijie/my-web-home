@@ -98,6 +98,10 @@ def list_opportunities(
     platform: str = "",
     q: str = "",
     min_score: int = Query(0, ge=0, le=100),
+    min_comments: int = Query(0, ge=0, le=1000000),
+    trend: str = "",
+    risk: str = "",
+    sort: str = "score",
 ):
     clauses = ["score >= %s"]
     params: list[object] = [min_score]
@@ -111,23 +115,44 @@ def list_opportunities(
         clauses.append("(product ILIKE %s OR gap ILIKE %s OR pain_points ILIKE %s)")
         needle = f"%{q}%"
         params.extend([needle, needle, needle])
+    if min_comments:
+        clauses.append("comment_count >= %s")
+        params.append(min_comments)
+    if trend == "rising":
+        clauses.append("momentum >= 70")
+    elif trend == "stable":
+        clauses.append("momentum >= 40 AND momentum < 70")
+    elif trend == "cooling":
+        clauses.append("momentum < 40")
+    if risk:
+        clauses.append("risk ILIKE %s")
+        params.append(f"%{risk}%")
+    order = {"score": "score DESC, created_at DESC", "momentum": "momentum DESC, score DESC",
+             "demand": "demand DESC, score DESC", "comments": "comment_count DESC, score DESC",
+             "recent": "created_at DESC"}.get(sort, "score DESC, created_at DESC")
     query = f"""SELECT id,product,category,platform,score,momentum,cross_platform,
       demand,gap,risk,source_url,comment_count,pain_points,created_at
       FROM opportunities WHERE {' AND '.join(clauses)}
-      ORDER BY score DESC, created_at DESC LIMIT 200"""
+      ORDER BY {order} LIMIT 200"""
     with db() as conn:
         rows = conn.execute(query, params).fetchall()
     keys = ["id", "product", "category", "platform", "score", "momentum", "cross_platform",
             "demand", "gap", "risk", "source_url", "comment_count", "pain_points", "created_at"]
-    return [dict(zip(keys, row)) for row in rows]
+    result = []
+    for row in rows:
+        item = dict(zip(keys, row))
+        item["trend_state"] = "rising" if item["momentum"] >= 70 else ("stable" if item["momentum"] >= 40 else "cooling")
+        result.append(item)
+    return result
 
 
 @app.get("/api/summary")
 def summary():
     with db() as conn:
-        total, avg, high, comments = conn.execute(
+        total, avg, high, comments, today = conn.execute(
             """SELECT count(*), coalesce(round(avg(score)),0),
-            count(*) FILTER (WHERE score>=70), coalesce(sum(comment_count),0)
+            count(*) FILTER (WHERE score>=70), coalesce(sum(comment_count),0),
+            count(*) FILTER (WHERE created_at >= CURRENT_DATE)
             FROM opportunities"""
         ).fetchone()
         categories = conn.execute(
@@ -137,7 +162,7 @@ def summary():
             "SELECT platform, count(*) FROM opportunities GROUP BY platform ORDER BY count(*) DESC"
         ).fetchall()
     return {
-        "total": total, "average_score": avg, "high_priority": high,
+        "total": total, "average_score": avg, "high_priority": high, "today_new": today,
         "comment_count": comments,
         "categories": [{"name": x[0], "count": x[1]} for x in categories],
         "platforms": [{"name": x[0], "count": x[1]} for x in platforms],
