@@ -67,6 +67,18 @@ def init_db():
           started_at TIMESTAMPTZ NOT NULL DEFAULT now(),
           finished_at TIMESTAMPTZ
         )""")
+        conn.execute("""CREATE TABLE IF NOT EXISTS google_trends (
+          id SERIAL PRIMARY KEY,
+          keyword TEXT NOT NULL,
+          region TEXT NOT NULL DEFAULT 'US',
+          trend_date DATE NOT NULL,
+          interest INTEGER NOT NULL DEFAULT 0,
+          related_query TEXT NOT NULL DEFAULT '',
+          related_value INTEGER NOT NULL DEFAULT 0,
+          source_url TEXT NOT NULL,
+          created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+          UNIQUE(keyword, trend_date, related_query)
+        )""")
         # Remove only the three known seed rows. Live Bright Data rows have a source URL.
         conn.execute("""DELETE FROM opportunities
           WHERE source_url = '' AND product IN (
@@ -229,10 +241,21 @@ def status():
     with db() as conn:
         last = conn.execute("""SELECT keyword,status,new_items,error_message,started_at,finished_at
           FROM collector_runs ORDER BY started_at DESC LIMIT 1""").fetchone()
-    result = {"app": "ok", "brightdata_configured": bool(os.environ.get("BRIGHTDATA_API_TOKEN")), "last_run": None}
+    result = {"app": "ok", "brightdata_configured": bool(os.environ.get("BRIGHTDATA_API_TOKEN")),
+              "google_trends_enabled": os.environ.get("GOOGLE_TRENDS_ENABLED", "false").lower() in {"1", "true", "yes"}, "last_run": None}
     if last:
         result["last_run"] = dict(zip(["keyword", "status", "new_items", "error", "started_at", "finished_at"], last))
     return result
+
+
+@app.get("/api/google-trends")
+def google_trends(days: int = Query(30, ge=1, le=90)):
+    with db() as conn:
+        rows = conn.execute("""SELECT keyword,region,trend_date,interest,related_query,related_value,source_url
+          FROM google_trends WHERE trend_date >= CURRENT_DATE - (%s * INTERVAL '1 day')
+          ORDER BY trend_date DESC, interest DESC, related_value DESC LIMIT 300""", (days,)).fetchall()
+    keys = ["keyword", "region", "date", "interest", "related_query", "related_value", "source_url"]
+    return [dict(zip(keys, row)) for row in rows]
 
 
 @app.get("/api/reports/{report_type}")

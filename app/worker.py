@@ -3,6 +3,8 @@ import os
 import re
 import time
 import urllib.request
+import urllib.parse
+from datetime import datetime, timezone
 
 import psycopg
 
@@ -12,6 +14,9 @@ INTERVAL = int(os.environ.get("COLLECTION_INTERVAL_SECONDS", "86400"))
 LIMIT = int(os.environ.get("POSTS_PER_KEYWORD", "3"))
 COLLECT_COMMENTS = os.environ.get("COLLECT_COMMENTS", "true").lower() in {"1", "true", "yes"}
 MAX_COMMENT_POSTS = int(os.environ.get("MAX_COMMENT_POSTS_PER_RUN", "3"))
+GOOGLE_TRENDS_ENABLED = os.environ.get("GOOGLE_TRENDS_ENABLED", "false").lower() in {"1", "true", "yes"}
+GOOGLE_TRENDS_KEYWORDS = [x.strip() for x in os.environ.get("GOOGLE_TRENDS_KEYWORDS", "pet cooling mat,walking pad,pantry organizer").split(",") if x.strip()]
+SERP_ZONE = os.environ.get("BRIGHTDATA_SERP_ZONE", "serp_api1")
 KEYWORDS = [("pet cooling mat", "Pets"), ("under desk walking pad", "Fitness"), ("pantry organizer", "Home")]
 POSTS_URL = "https://api.brightdata.com/datasets/v3/scrape?dataset_id=gd_lu702nij2f790tmv9h&type=discover_new&discover_by=keyword&include_errors=true"
 COMMENTS_URL = "https://api.brightdata.com/datasets/v3/scrape?dataset_id=gd_lkf2st302ap89utw5k&include_errors=true"
@@ -46,6 +51,48 @@ def request_json(url, payload):
         return parsed if isinstance(parsed, list) else [parsed]
     except json.JSONDecodeError:
         return [json.loads(line) for line in raw.splitlines() if line.strip()]
+
+
+def request_google_trends(keyword):
+    encoded = urllib.parse.quote_plus(keyword)
+    source_url = f"https://trends.google.com/trends/explore?q={encoded}&geo=US&brd_trends=timeseries,geo_map&brd_json=1"
+    payload = {"zone": SERP_ZONE, "url": source_url, "format": "raw"}
+    data = json.dumps(payload).encode()
+    req = urllib.request.Request("https://api.brightdata.com/request", data=data,
+      headers={"Authorization": f"Bearer {TOKEN}", "Content-Type": "application/json"}, method="POST")
+    with urllib.request.urlopen(req, timeout=180) as response:
+        return json.loads(response.read().decode()), source_url
+
+
+def save_google_trends(keyword):
+    parsed, source_url = request_google_trends(keyword)
+    timeline = []
+    related = []
+    for widget in parsed.get("widgets", []):
+        data = widget.get("data", {}).get("default", {})
+        if data.get("timelineData"):
+            timeline = data["timelineData"]
+        if widget.get("id") == "RELATED_QUERIES":
+            for group in data.get("rankedList", []):
+                related.extend(group.get("rankedKeyword", []))
+    with psycopg.connect(DB) as conn:
+        for point in timeline:
+            try:
+                trend_date = datetime.fromtimestamp(int(point.get("time", 0)), timezone.utc).date()
+                interest = int((point.get("value") or [0])[0] or 0)
+            except (TypeError, ValueError, OverflowError):
+                continue
+            conn.execute("""INSERT INTO google_trends(keyword,trend_date,interest,source_url)
+              VALUES(%s,%s,%s,%s) ON CONFLICT(keyword,trend_date,related_query) DO UPDATE SET interest=EXCLUDED.interest""",
+              (keyword, trend_date, interest, source_url))
+        for item in related[:30]:
+            query = str(item.get("query") or item.get("keyword") or "")[:200]
+            if not query:
+                continue
+            value = int(item.get("value") or 0)
+            conn.execute("""INSERT INTO google_trends(keyword,trend_date,interest,related_query,related_value,source_url)
+              VALUES(%s,CURRENT_DATE,0,%s,%s,%s) ON CONFLICT(keyword,trend_date,related_query) DO UPDATE SET related_value=EXCLUDED.related_value""",
+              (keyword, query, value, source_url))
 
 
 def collect(keyword):
@@ -126,6 +173,13 @@ def snapshot(category):
 def run():
     if not TOKEN:
         raise RuntimeError("BRIGHTDATA_API_TOKEN is missing")
+    if GOOGLE_TRENDS_ENABLED:
+        for keyword in GOOGLE_TRENDS_KEYWORDS:
+            try:
+                save_google_trends(keyword)
+                print(f"collected Google Trends: {keyword}", flush=True)
+            except Exception as exc:
+                print(f"Google Trends failed for {keyword}: {exc}", flush=True)
     comment_budget = MAX_COMMENT_POSTS
     for keyword, category in KEYWORDS:
         started = None
