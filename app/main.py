@@ -3,17 +3,19 @@ from contextlib import contextmanager
 from datetime import datetime, timezone
 
 import psycopg
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Query
 from fastapi.responses import HTMLResponse
 from pydantic import BaseModel, Field
 
 DATABASE_URL = os.environ["DATABASE_URL"]
 app = FastAPI(title="US Trend Radar")
 
+
 @contextmanager
 def db():
     with psycopg.connect(DATABASE_URL) as conn:
         yield conn
+
 
 def init_db():
     with db() as conn:
@@ -21,19 +23,48 @@ def init_db():
           id SERIAL PRIMARY KEY, product TEXT NOT NULL, category TEXT NOT NULL,
           platform TEXT NOT NULL, score INTEGER NOT NULL, momentum INTEGER NOT NULL,
           cross_platform INTEGER NOT NULL, demand INTEGER NOT NULL,
-          gap TEXT NOT NULL, risk TEXT NOT NULL, source_url TEXT, created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+          gap TEXT NOT NULL, risk TEXT NOT NULL, source_url TEXT,
+          comment_count INTEGER NOT NULL DEFAULT 0,
+          pain_points TEXT NOT NULL DEFAULT '',
+          created_at TIMESTAMPTZ NOT NULL DEFAULT now()
         )""")
-        count = conn.execute("SELECT count(*) FROM opportunities").fetchone()[0]
-        if count == 0:
-            conn.execute("""INSERT INTO opportunities
-            (product,category,platform,score,momentum,cross_platform,demand,gap,risk,source_url) VALUES
-            ('Portable pet cooling mat','Pets','TikTok',72,82,60,74,'Improve non-slip backing and washable cover','Verify materials and heat claims',''),
-            ('Under-desk walking pad accessories','Fitness','YouTube',68,69,64,73,'Quiet, compact storage and desk-fit bundles','Check electrical and warranty requirements',''),
-            ('Modular pantry organizer','Home','Instagram',65,61,58,71,'Solve deep-cabinet access and label compatibility','Low; validate dimension demand','')""")
+        conn.execute("ALTER TABLE opportunities ADD COLUMN IF NOT EXISTS comment_count INTEGER NOT NULL DEFAULT 0")
+        conn.execute("ALTER TABLE opportunities ADD COLUMN IF NOT EXISTS pain_points TEXT NOT NULL DEFAULT ''")
+        conn.execute("""CREATE TABLE IF NOT EXISTS comments (
+          id SERIAL PRIMARY KEY,
+          opportunity_id INTEGER NOT NULL REFERENCES opportunities(id) ON DELETE CASCADE,
+          platform TEXT NOT NULL,
+          comment_text TEXT NOT NULL,
+          likes INTEGER NOT NULL DEFAULT 0,
+          replies INTEGER NOT NULL DEFAULT 0,
+          pain_label TEXT NOT NULL DEFAULT 'other',
+          comment_url TEXT UNIQUE,
+          created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+        )""")
+        conn.execute("""CREATE TABLE IF NOT EXISTS trend_snapshots (
+          id SERIAL PRIMARY KEY,
+          snapshot_date DATE NOT NULL DEFAULT CURRENT_DATE,
+          category TEXT NOT NULL,
+          platform TEXT NOT NULL,
+          opportunity_count INTEGER NOT NULL,
+          avg_score INTEGER NOT NULL,
+          avg_momentum INTEGER NOT NULL,
+          avg_demand INTEGER NOT NULL,
+          comment_count INTEGER NOT NULL DEFAULT 0,
+          UNIQUE(snapshot_date, category, platform)
+        )""")
+        # Remove only the three known seed rows. Live Bright Data rows have a source URL.
+        conn.execute("""DELETE FROM opportunities
+          WHERE source_url = '' AND product IN (
+            'Portable pet cooling mat', 'Under-desk walking pad accessories',
+            'Modular pantry organizer'
+          )""")
+
 
 @app.on_event("startup")
 def startup():
     init_db()
+
 
 class Opportunity(BaseModel):
     product: str = Field(min_length=2, max_length=160)
@@ -46,35 +77,123 @@ class Opportunity(BaseModel):
     risk: str
     source_url: str = ""
 
+
 @app.get("/api/opportunities")
-def list_opportunities():
+def list_opportunities(
+    category: str = "",
+    platform: str = "",
+    q: str = "",
+    min_score: int = Query(0, ge=0, le=100),
+):
+    clauses = ["score >= %s"]
+    params: list[object] = [min_score]
+    if category:
+        clauses.append("category = %s")
+        params.append(category)
+    if platform:
+        clauses.append("platform = %s")
+        params.append(platform)
+    if q:
+        clauses.append("(product ILIKE %s OR gap ILIKE %s OR pain_points ILIKE %s)")
+        needle = f"%{q}%"
+        params.extend([needle, needle, needle])
+    query = f"""SELECT id,product,category,platform,score,momentum,cross_platform,
+      demand,gap,risk,source_url,comment_count,pain_points,created_at
+      FROM opportunities WHERE {' AND '.join(clauses)}
+      ORDER BY score DESC, created_at DESC LIMIT 200"""
     with db() as conn:
-        rows = conn.execute("SELECT id,product,category,platform,score,momentum,cross_platform,demand,gap,risk,source_url,created_at FROM opportunities ORDER BY score DESC, created_at DESC").fetchall()
-    keys = ["id","product","category","platform","score","momentum","cross_platform","demand","gap","risk","source_url","created_at"]
+        rows = conn.execute(query, params).fetchall()
+    keys = ["id", "product", "category", "platform", "score", "momentum", "cross_platform",
+            "demand", "gap", "risk", "source_url", "comment_count", "pain_points", "created_at"]
     return [dict(zip(keys, row)) for row in rows]
+
 
 @app.get("/api/summary")
 def summary():
     with db() as conn:
-        total, avg, high = conn.execute("SELECT count(*), coalesce(round(avg(score)),0), count(*) FILTER (WHERE score>=70) FROM opportunities").fetchone()
-        categories = conn.execute("SELECT category, count(*) FROM opportunities GROUP BY category ORDER BY count(*) DESC").fetchall()
-    return {"total": total, "average_score": avg, "high_priority": high, "categories": categories}
+        total, avg, high, comments = conn.execute(
+            """SELECT count(*), coalesce(round(avg(score)),0),
+            count(*) FILTER (WHERE score>=70), coalesce(sum(comment_count),0)
+            FROM opportunities"""
+        ).fetchone()
+        categories = conn.execute(
+            "SELECT category, count(*) FROM opportunities GROUP BY category ORDER BY count(*) DESC"
+        ).fetchall()
+        platforms = conn.execute(
+            "SELECT platform, count(*) FROM opportunities GROUP BY platform ORDER BY count(*) DESC"
+        ).fetchall()
+    return {
+        "total": total, "average_score": avg, "high_priority": high,
+        "comment_count": comments,
+        "categories": [{"name": x[0], "count": x[1]} for x in categories],
+        "platforms": [{"name": x[0], "count": x[1]} for x in platforms],
+    }
+
+
+@app.get("/api/filters")
+def filters():
+    with db() as conn:
+        categories = conn.execute("SELECT DISTINCT category FROM opportunities ORDER BY category").fetchall()
+        platforms = conn.execute("SELECT DISTINCT platform FROM opportunities ORDER BY platform").fetchall()
+    return {"categories": [x[0] for x in categories], "platforms": [x[0] for x in platforms]}
+
+
+@app.get("/api/trends")
+def trends(days: int = Query(30, ge=7, le=180)):
+    with db() as conn:
+        rows = conn.execute("""SELECT snapshot_date,category,platform,opportunity_count,
+          avg_score,avg_momentum,avg_demand,comment_count
+          FROM trend_snapshots WHERE snapshot_date >= CURRENT_DATE - (%s * INTERVAL '1 day')
+          ORDER BY snapshot_date ASC, category, platform""", (days,)).fetchall()
+    keys = ["date", "category", "platform", "opportunity_count", "avg_score", "avg_momentum", "avg_demand", "comment_count"]
+    return [dict(zip(keys, row)) for row in rows]
+
+
+@app.get("/api/pains")
+def pains(limit: int = Query(12, ge=1, le=50)):
+    with db() as conn:
+        rows = conn.execute("""SELECT pain_label, count(*), coalesce(sum(likes),0),
+          max(comment_text) FROM comments GROUP BY pain_label ORDER BY count(*) DESC LIMIT %s""", (limit,)).fetchall()
+    return [{"label": x[0], "count": x[1], "likes": x[2], "example": x[3]} for x in rows]
+
+
+@app.get("/api/benchmarks")
+def benchmarks():
+    with db() as conn:
+        rows = conn.execute("""SELECT category,platform,count(*),round(avg(score)),
+          max(score),round(avg(momentum)),round(avg(demand)),coalesce(sum(comment_count),0)
+          FROM opportunities GROUP BY category,platform ORDER BY avg(score) DESC""").fetchall()
+    keys = ["category", "platform", "opportunity_count", "avg_score", "top_score", "avg_momentum", "avg_demand", "comments"]
+    return [dict(zip(keys, row)) for row in rows]
+
 
 @app.post("/api/opportunities", status_code=201)
 def add_opportunity(item: Opportunity):
-    score = round(item.momentum*.35 + item.cross_platform*.25 + item.demand*.25 + 15)
+    score = round(item.momentum * .35 + item.cross_platform * .25 + item.demand * .25 + 15)
     with db() as conn:
-        row = conn.execute("""INSERT INTO opportunities(product,category,platform,score,momentum,cross_platform,demand,gap,risk,source_url)
-        VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s) RETURNING id""", (item.product,item.category,item.platform,score,item.momentum,item.cross_platform,item.demand,item.gap,item.risk,item.source_url)).fetchone()
+        row = conn.execute("""INSERT INTO opportunities
+          (product,category,platform,score,momentum,cross_platform,demand,gap,risk,source_url)
+          VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s) RETURNING id""",
+          (item.product, item.category, item.platform, score, item.momentum,
+           item.cross_platform, item.demand, item.gap, item.risk, item.source_url)).fetchone()
     return {"id": row[0], "score": score}
+
 
 @app.get("/health")
 def health():
     return {"status": "ok", "time": datetime.now(timezone.utc)}
 
+
 @app.get("/", response_class=HTMLResponse)
 def dashboard():
-    return """<!doctype html><html><head><meta charset='utf-8'><title>US Trend Radar</title><style>
-body{font:15px system-ui;background:#f5f7fb;color:#182033;margin:0;padding:38px;max-width:1500px;margin:auto}h1{margin:0;font-size:30px}p{color:#64748b}.grid{display:grid;grid-template-columns:repeat(3,1fr);gap:16px;margin-top:22px}.metric,.card{background:white;border-radius:16px;padding:22px;box-shadow:0 2px 12px #dce1ee}.metric b{display:block;font-size:30px;margin-top:8px}.label{color:#64748b;font-size:13px}.card{margin-top:18px}table{width:100%;border-collapse:collapse}th,td{text-align:left;padding:14px 12px;border-bottom:1px solid #e8ebf2;vertical-align:top}th{color:#64748b}.score{font-weight:800;color:#2563eb}.tag{background:#e8f0ff;color:#2563eb;border-radius:99px;padding:4px 9px;font-size:12px}a{color:#2563eb}@media(max-width:800px){.grid{grid-template-columns:1fr}body{padding:18px}}</style></head><body>
-<h1>US Trend Radar <span class='tag'>美国社媒选品雷达</span></h1><p>每日一次采集 · TikTok 真实信号 · 家居 / 宠物 / 健身</p><section class='grid'><div class='metric'><span class='label'>已发现机会</span><b id='total'>–</b></div><div class='metric'><span class='label'>平均机会评分</span><b id='avg'>–</b></div><div class='metric'><span class='label'>优先验证（≥70）</span><b id='high'>–</b></div></section><div class='card'><h2>机会榜</h2><p class='label'>评分是筛选信号，不等于销量结论；请结合竞品、利润与合规复核。</p><table><thead><tr><th>社媒信号 / 产品机会</th><th>类目</th><th>平台</th><th>评分</th><th>下一步验证</th><th>来源</th></tr></thead><tbody id='rows'></tbody></table></div>
-<script>Promise.all([fetch('/api/opportunities').then(r=>r.json()),fetch('/api/summary').then(r=>r.json())]).then(([items,s])=>{total.textContent=s.total;avg.textContent=s.average_score;high.textContent=s.high_priority;rows.innerHTML=items.map(x=>`<tr><td>${x.product}</td><td><span class='tag'>${x.category}</span></td><td>${x.platform}</td><td class='score'>${x.score}</td><td>${x.gap}</td><td>${x.source_url?`<a target='_blank' href='${x.source_url}'>查看原帖</a>`:'示例信号'}</td></tr>`).join('')})</script></body></html>"""
+    return r'''<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>US Trend Radar</title><style>
+:root{--ink:#172033;--muted:#64748b;--line:#e7ebf3;--blue:#2563eb;--bg:#f5f7fb;--card:#fff}*{box-sizing:border-box}body{font:14px/1.5 system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;background:var(--bg);color:var(--ink);margin:0}.shell{max-width:1500px;margin:auto;padding:34px 28px 60px}h1{font-size:30px;letter-spacing:-.5px;margin:0}h2{font-size:18px;margin:0 0 5px}.sub{color:var(--muted);margin:7px 0 0}.grid{display:grid;grid-template-columns:repeat(4,1fr);gap:14px;margin:24px 0 16px}.card,.metric{background:var(--card);border:1px solid var(--line);border-radius:16px;box-shadow:0 6px 24px #1f3a5f0b}.metric{padding:18px 20px}.metric .label{color:var(--muted);font-size:12px}.metric b{display:block;font-size:29px;margin-top:7px}.card{padding:20px;margin-top:16px}.toolbar{display:flex;flex-wrap:wrap;gap:10px;margin:14px 0}.toolbar input,.toolbar select{border:1px solid #d6ddea;border-radius:9px;padding:9px 11px;background:white;color:var(--ink)}button{border:0;border-radius:9px;padding:9px 15px;background:var(--blue);color:white;cursor:pointer}button.secondary{background:#edf3ff;color:var(--blue)}table{width:100%;border-collapse:collapse}th,td{text-align:left;padding:13px 10px;border-bottom:1px solid var(--line);vertical-align:top}th{font-size:12px;color:var(--muted);font-weight:600}.score{font-weight:800;color:var(--blue);font-size:17px}.tag{display:inline-block;background:#edf3ff;color:var(--blue);border-radius:99px;padding:3px 8px;font-size:12px}.muted{color:var(--muted);font-size:12px}.pill{display:inline-block;padding:4px 8px;border-radius:7px;background:#f1f5f9;margin:2px 3px 2px 0;font-size:12px}.section-head{display:flex;justify-content:space-between;align-items:center;gap:8px}.note{background:#fff9e8;border:1px solid #f3df9d;color:#7c5d0b;padding:11px 13px;border-radius:10px;margin:12px 0;font-size:12px}.chart{width:100%;height:220px}.empty{color:var(--muted);padding:20px 0}.split{display:grid;grid-template-columns:1.2fr .8fr;gap:16px}.bar{height:8px;background:#e8eefb;border-radius:9px;overflow:hidden}.bar i{display:block;height:100%;background:var(--blue)}a{color:var(--blue)}@media(max-width:1000px){.grid{grid-template-columns:repeat(2,1fr)}.split{grid-template-columns:1fr}}@media(max-width:650px){.shell{padding:22px 14px}.grid{grid-template-columns:1fr}table{min-width:900px}.card.table-wrap{overflow:auto}}
+</style></head><body><main class="shell"><h1>US Trend Radar <span class="tag">美区社媒选品</span></h1><p class="sub">每日信号 · TikTok 发现 · 趋势曲线 · 评论痛点 · 类目基准</p><section class="grid"><div class="metric"><span class="label">机会信号</span><b id="total">—</b></div><div class="metric"><span class="label">平均机会分</span><b id="avg">—</b></div><div class="metric"><span class="label">优先验证（≥70）</span><b id="high">—</b></div><div class="metric"><span class="label">已采集评论</span><b id="comments">—</b></div></section><section class="card"><div class="section-head"><div><h2>机会筛选</h2><span class="muted">按信号筛选，点击来源可回看原帖</span></div><button class="secondary" id="reset">重置</button></div><div class="toolbar"><input id="q" placeholder="搜索产品、痛点或改进方向"><select id="category"><option value="">全部类目</option></select><select id="platform"><option value="">全部平台</option></select><select id="min"><option value="0">最低分：不限</option><option value="70">最低分：70</option><option value="80">最低分：80</option><option value="90">最低分：90</option></select><button id="filter">应用筛选</button></div></section><section class="card table-wrap"><div class="section-head"><h2>机会榜</h2><span class="muted" id="updated"></span></div><div class="note">机会分是社媒需求信号，不是销量或利润结论；采购前仍需核验竞品、成本、知识产权、安全与平台规则。</div><table><thead><tr><th>产品机会</th><th>类目</th><th>平台</th><th>机会分</th><th>动能 / 需求</th><th>评论痛点</th><th>下一步</th><th>来源</th></tr></thead><tbody id="rows"></tbody></table></section><div class="split"><section class="card"><div class="section-head"><h2>趋势曲线（近30天）</h2><span class="muted">每日快照</span></div><canvas class="chart" id="trendChart"></canvas><div id="trendLegend" class="muted"></div></section><section class="card"><div class="section-head"><h2>评论痛点</h2><span class="muted">关键词归类，需人工复核</span></div><div id="pains"></div></section></div><section class="card table-wrap"><div class="section-head"><h2>竞品/类目基准</h2><span class="muted">同类目与平台的信号对标，不等于市场销量</span></div><table><thead><tr><th>类目</th><th>平台</th><th>信号数</th><th>平均分</th><th>最高分</th><th>平均动能</th><th>平均需求</th><th>评论数</th></tr></thead><tbody id="benchmarks"></tbody></table></section></main><script>
+const $=id=>document.getElementById(id);const esc=s=>String(s??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+async function loadFilters(){const d=await fetch('/api/filters').then(r=>r.json());for(const x of d.categories){$('category').insertAdjacentHTML('beforeend',`<option>${esc(x)}</option>`)}for(const x of d.platforms){$('platform').insertAdjacentHTML('beforeend',`<option>${esc(x)}</option>`)}}
+async function loadRows(){const p=new URLSearchParams({category:$('category').value,platform:$('platform').value,q:$('q').value,min_score:$('min').value});const data=await fetch('/api/opportunities?'+p).then(r=>r.json());$('rows').innerHTML=data.length?data.map(x=>`<tr><td><b>${esc(x.product)}</b><div class="muted">${esc(x.risk)}</div></td><td><span class="tag">${esc(x.category)}</span></td><td>${esc(x.platform)}</td><td class="score">${x.score}</td><td>${x.momentum} 动能<br>${x.demand} 需求</td><td>${x.comment_count?`<b>${x.comment_count}</b> 条<br>`:''}${esc(x.pain_points||'暂无评论归类')}</td><td>${esc(x.gap)}</td><td>${x.source_url?`<a target="_blank" rel="noreferrer" href="${esc(x.source_url)}">原帖</a>`:'—'}</td></tr>`).join(''):'<tr><td colspan="8" class="empty">暂无符合条件的信号</td></tr>';$('updated').textContent=`更新于 ${new Date().toLocaleString()}`}
+async function loadSummary(){const s=await fetch('/api/summary').then(r=>r.json());$('total').textContent=s.total;$('avg').textContent=s.average_score;$('high').textContent=s.high_priority;$('comments').textContent=s.comment_count}
+async function loadPains(){const d=await fetch('/api/pains').then(r=>r.json());$('pains').innerHTML=d.length?d.map(x=>`<div style="margin:13px 0"><div><span class="pill">${esc(x.label)}</span><b>${x.count}</b> 条 <span class="muted">${x.likes} 赞</span></div><div class="muted">例：${esc(x.example)}</div></div>`).join(''):'<div class="empty">评论数据将在下一轮采集后出现</div>'}
+async function loadBenchmarks(){const d=await fetch('/api/benchmarks').then(r=>r.json());$('benchmarks').innerHTML=d.length?d.map(x=>`<tr><td>${esc(x.category)}</td><td>${esc(x.platform)}</td><td>${x.opportunity_count}</td><td class="score">${x.avg_score}</td><td>${x.top_score}</td><td>${x.avg_momentum}</td><td>${x.avg_demand}</td><td>${x.comments}</td></tr>`).join(''):'<tr><td colspan="8" class="empty">暂无基准数据</td></tr>'}
+async function loadTrend(){const d=await fetch('/api/trends?days=30').then(r=>r.json());const c=$('trendChart'),ctx=c.getContext('2d'),w=c.clientWidth*devicePixelRatio,h=c.clientHeight*devicePixelRatio;c.width=w;c.height=h;ctx.clearRect(0,0,w,h);if(!d.length){$('trendLegend').textContent='趋势快照将在下一轮采集后形成';return}const groups={};d.forEach(x=>(groups[x.category]??=[]).push(x));const colors=['#2563eb','#16a34a','#ea580c','#9333ea'];const max=Math.max(...d.map(x=>x.avg_score),100);Object.entries(groups).forEach(([name,vals],i)=>{ctx.strokeStyle=colors[i%colors.length];ctx.lineWidth=3;ctx.beginPath();vals.forEach((x,j)=>{const px=24+(j/Math.max(vals.length-1,1))*(w-42),py=h-28-(x.avg_score/max)*(h-48);j?ctx.lineTo(px,py):ctx.moveTo(px,py)});ctx.stroke()});$('trendLegend').innerHTML=Object.keys(groups).map((x,i)=>`<span style="color:${colors[i%colors.length]};margin-right:15px">● ${esc(x)}</span>`).join('')}
+async function load(){await Promise.all([loadRows(),loadSummary(),loadPains(),loadBenchmarks(),loadTrend()])}$('filter').onclick=loadRows;$('reset').onclick=()=>{$('q').value='';$('category').value='';$('platform').value='';$('min').value='0';loadRows()};loadFilters().then(load);</script></body></html>'''
