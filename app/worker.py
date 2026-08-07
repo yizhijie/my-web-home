@@ -128,7 +128,10 @@ def run():
         raise RuntimeError("BRIGHTDATA_API_TOKEN is missing")
     comment_budget = MAX_COMMENT_POSTS
     for keyword, category in KEYWORDS:
+        started = None
         try:
+            with psycopg.connect(DB) as conn:
+                started = conn.execute("INSERT INTO collector_runs(keyword,status) VALUES(%s,'running') RETURNING id", (keyword,)).fetchone()[0]
             urls = save_posts(collect(keyword), category)
             existing = pending_comments(category, max(comment_budget - len(urls), 0))
             candidates = urls + [x for x in existing if x not in urls]
@@ -136,8 +139,13 @@ def run():
                 collect_comments(opportunity_id, post_url)
                 comment_budget -= 1
             snapshot(category)
+            with psycopg.connect(DB) as conn:
+                conn.execute("UPDATE collector_runs SET status='success',new_items=%s,finished_at=now() WHERE id=%s", (len(urls), started))
             print(f"collected {keyword}: {len(urls)} new posts", flush=True)
         except Exception as exc:
+            if started:
+                with psycopg.connect(DB) as conn:
+                    conn.execute("UPDATE collector_runs SET status='error',error_message=%s,finished_at=now() WHERE id=%s", (str(exc)[:500], started))
             print(f"collection failed for {keyword}: {exc}", flush=True)
 
 

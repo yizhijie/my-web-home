@@ -1,4 +1,8 @@
 import os
+import csv
+import io
+import json
+from pathlib import Path
 from contextlib import contextmanager
 from datetime import datetime, timezone
 
@@ -53,6 +57,15 @@ def init_db():
           avg_demand INTEGER NOT NULL,
           comment_count INTEGER NOT NULL DEFAULT 0,
           UNIQUE(snapshot_date, category, platform)
+        )""")
+        conn.execute("""CREATE TABLE IF NOT EXISTS collector_runs (
+          id SERIAL PRIMARY KEY,
+          keyword TEXT NOT NULL,
+          status TEXT NOT NULL,
+          new_items INTEGER NOT NULL DEFAULT 0,
+          error_message TEXT NOT NULL DEFAULT '',
+          started_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+          finished_at TIMESTAMPTZ
         )""")
         # Remove only the three known seed rows. Live Bright Data rows have a source URL.
         conn.execute("""DELETE FROM opportunities
@@ -168,6 +181,74 @@ def benchmarks():
     return [dict(zip(keys, row)) for row in rows]
 
 
+@app.get("/api/opportunities/{opportunity_id}")
+def opportunity_detail(opportunity_id: int):
+    with db() as conn:
+        row = conn.execute("""SELECT id,product,category,platform,score,momentum,cross_platform,
+          demand,gap,risk,source_url,comment_count,pain_points,created_at
+          FROM opportunities WHERE id=%s""", (opportunity_id,)).fetchone()
+        if not row:
+            raise HTTPException(status_code=404, detail="Opportunity not found")
+        comments = conn.execute("""SELECT comment_text,likes,replies,pain_label,comment_url,created_at
+          FROM comments WHERE opportunity_id=%s ORDER BY likes DESC, created_at DESC LIMIT 30""", (opportunity_id,)).fetchall()
+    keys = ["id", "product", "category", "platform", "score", "momentum", "cross_platform", "demand",
+            "gap", "risk", "source_url", "comment_count", "pain_points", "created_at"]
+    comment_keys = ["text", "likes", "replies", "pain_label", "url", "created_at"]
+    result = dict(zip(keys, row))
+    result["comments"] = [dict(zip(comment_keys, x)) for x in comments]
+    return result
+
+
+@app.get("/api/status")
+def status():
+    with db() as conn:
+        last = conn.execute("""SELECT keyword,status,new_items,error_message,started_at,finished_at
+          FROM collector_runs ORDER BY started_at DESC LIMIT 1""").fetchone()
+    result = {"app": "ok", "brightdata_configured": bool(os.environ.get("BRIGHTDATA_API_TOKEN")), "last_run": None}
+    if last:
+        result["last_run"] = dict(zip(["keyword", "status", "new_items", "error", "started_at", "finished_at"], last))
+    return result
+
+
+@app.get("/api/reports/{report_type}")
+def report(report_type: str):
+    valid = {"today", "weekly", "high", "pains", "benchmarks"}
+    if report_type not in valid:
+        raise HTTPException(status_code=400, detail="Unknown report type")
+    with db() as conn:
+        if report_type == "pains":
+            rows = conn.execute("""SELECT pain_label,count(*),coalesce(sum(likes),0),max(comment_text)
+              FROM comments GROUP BY pain_label ORDER BY count(*) DESC""").fetchall()
+            lines = ["# 评论痛点报告", "", "> 机器关键词归类，需人工复核。"]
+            lines += [f"- {x[0]}：{x[1]} 条，点赞 {x[2]}；示例：{x[3]}" for x in rows]
+        elif report_type == "benchmarks":
+            rows = conn.execute("""SELECT category,platform,count(*),round(avg(score)),max(score),round(avg(momentum)),round(avg(demand))
+              FROM opportunities GROUP BY category,platform ORDER BY avg(score) DESC""").fetchall()
+            lines = ["# 类目与平台基准报告", "", "| 类目 | 平台 | 信号数 | 平均分 | 最高分 | 平均动能 | 平均需求 |", "|---|---|---:|---:|---:|---:|---:|"]
+            lines += [f"| {x[0]} | {x[1]} | {x[2]} | {x[3]} | {x[4]} | {x[5]} | {x[6]} |" for x in rows]
+        else:
+            condition = "score >= 70" if report_type == "high" else ("created_at >= CURRENT_DATE" if report_type == "today" else "created_at >= CURRENT_DATE - INTERVAL '7 days'")
+            rows = conn.execute(f"""SELECT product,category,platform,score,momentum,demand,comment_count,gap,risk,source_url
+              FROM opportunities WHERE {condition} ORDER BY score DESC LIMIT 100""").fetchall()
+            title = {"today": "今日机会报告", "weekly": "周趋势机会报告", "high": "高优先级机会报告"}[report_type]
+            lines = [f"# {title}", "", "> 机会分是社媒信号，不等于销量或利润结论。", "", "| 产品 | 类目 | 平台 | 机会分 | 动能 | 需求 | 评论 | 下一步 |", "|---|---|---|---:|---:|---:|---:|---|"]
+            lines += [f"| {x[0].replace('|','/')} | {x[1]} | {x[2]} | {x[3]} | {x[4]} | {x[5]} | {x[6]} | {x[7].replace('|','/')} |" for x in rows]
+    return {"type": report_type, "markdown": "\n".join(lines)}
+
+
+@app.get("/api/export.csv")
+def export_csv():
+    with db() as conn:
+        rows = conn.execute("""SELECT product,category,platform,score,momentum,demand,comment_count,pain_points,gap,risk,source_url,created_at
+          FROM opportunities ORDER BY score DESC,created_at DESC""").fetchall()
+    out = io.StringIO()
+    writer = csv.writer(out)
+    writer.writerow(["product", "category", "platform", "score", "momentum", "demand", "comments", "pain_points", "gap", "risk", "source_url", "created_at"])
+    writer.writerows(rows)
+    from fastapi.responses import Response
+    return Response(out.getvalue(), media_type="text/csv; charset=utf-8", headers={"Content-Disposition": "attachment; filename=trend-radar-opportunities.csv"})
+
+
 @app.post("/api/opportunities", status_code=201)
 def add_opportunity(item: Opportunity):
     score = round(item.momentum * .35 + item.cross_platform * .25 + item.demand * .25 + 15)
@@ -187,6 +268,7 @@ def health():
 
 @app.get("/", response_class=HTMLResponse)
 def dashboard():
+    return HTMLResponse(Path(__file__).with_name("dashboard.html").read_text(encoding="utf-8"))
     return r'''<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>US Trend Radar</title><style>
 :root{--ink:#172033;--muted:#64748b;--line:#e7ebf3;--blue:#2563eb;--bg:#f5f7fb;--card:#fff}*{box-sizing:border-box}body{font:14px/1.5 system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;background:var(--bg);color:var(--ink);margin:0}.shell{max-width:1500px;margin:auto;padding:34px 28px 60px}h1{font-size:30px;letter-spacing:-.5px;margin:0}h2{font-size:18px;margin:0 0 5px}.sub{color:var(--muted);margin:7px 0 0}.grid{display:grid;grid-template-columns:repeat(4,1fr);gap:14px;margin:24px 0 16px}.card,.metric{background:var(--card);border:1px solid var(--line);border-radius:16px;box-shadow:0 6px 24px #1f3a5f0b}.metric{padding:18px 20px}.metric .label{color:var(--muted);font-size:12px}.metric b{display:block;font-size:29px;margin-top:7px}.card{padding:20px;margin-top:16px}.toolbar{display:flex;flex-wrap:wrap;gap:10px;margin:14px 0}.toolbar input,.toolbar select{border:1px solid #d6ddea;border-radius:9px;padding:9px 11px;background:white;color:var(--ink)}button{border:0;border-radius:9px;padding:9px 15px;background:var(--blue);color:white;cursor:pointer}button.secondary{background:#edf3ff;color:var(--blue)}table{width:100%;border-collapse:collapse}th,td{text-align:left;padding:13px 10px;border-bottom:1px solid var(--line);vertical-align:top}th{font-size:12px;color:var(--muted);font-weight:600}.score{font-weight:800;color:var(--blue);font-size:17px}.tag{display:inline-block;background:#edf3ff;color:var(--blue);border-radius:99px;padding:3px 8px;font-size:12px}.muted{color:var(--muted);font-size:12px}.pill{display:inline-block;padding:4px 8px;border-radius:7px;background:#f1f5f9;margin:2px 3px 2px 0;font-size:12px}.section-head{display:flex;justify-content:space-between;align-items:center;gap:8px}.note{background:#fff9e8;border:1px solid #f3df9d;color:#7c5d0b;padding:11px 13px;border-radius:10px;margin:12px 0;font-size:12px}.chart{width:100%;height:220px}.empty{color:var(--muted);padding:20px 0}.split{display:grid;grid-template-columns:1.2fr .8fr;gap:16px}.bar{height:8px;background:#e8eefb;border-radius:9px;overflow:hidden}.bar i{display:block;height:100%;background:var(--blue)}a{color:var(--blue)}@media(max-width:1000px){.grid{grid-template-columns:repeat(2,1fr)}.split{grid-template-columns:1fr}}@media(max-width:650px){.shell{padding:22px 14px}.grid{grid-template-columns:1fr}table{min-width:900px}.card.table-wrap{overflow:auto}}
 </style></head><body><main class="shell"><h1>US Trend Radar <span class="tag">美区社媒选品</span></h1><p class="sub">每日信号 · TikTok 发现 · 趋势曲线 · 评论痛点 · 类目基准</p><section class="grid"><div class="metric"><span class="label">机会信号</span><b id="total">—</b></div><div class="metric"><span class="label">平均机会分</span><b id="avg">—</b></div><div class="metric"><span class="label">优先验证（≥70）</span><b id="high">—</b></div><div class="metric"><span class="label">已采集评论</span><b id="comments">—</b></div></section><section class="card"><div class="section-head"><div><h2>机会筛选</h2><span class="muted">按信号筛选，点击来源可回看原帖</span></div><button class="secondary" id="reset">重置</button></div><div class="toolbar"><input id="q" placeholder="搜索产品、痛点或改进方向"><select id="category"><option value="">全部类目</option></select><select id="platform"><option value="">全部平台</option></select><select id="min"><option value="0">最低分：不限</option><option value="70">最低分：70</option><option value="80">最低分：80</option><option value="90">最低分：90</option></select><button id="filter">应用筛选</button></div></section><section class="card table-wrap"><div class="section-head"><h2>机会榜</h2><span class="muted" id="updated"></span></div><div class="note">机会分是社媒需求信号，不是销量或利润结论；采购前仍需核验竞品、成本、知识产权、安全与平台规则。</div><table><thead><tr><th>产品机会</th><th>类目</th><th>平台</th><th>机会分</th><th>动能 / 需求</th><th>评论痛点</th><th>下一步</th><th>来源</th></tr></thead><tbody id="rows"></tbody></table></section><div class="split"><section class="card"><div class="section-head"><h2>趋势曲线（近30天）</h2><span class="muted">每日快照</span></div><canvas class="chart" id="trendChart"></canvas><div id="trendLegend" class="muted"></div></section><section class="card"><div class="section-head"><h2>评论痛点</h2><span class="muted">关键词归类，需人工复核</span></div><div id="pains"></div></section></div><section class="card table-wrap"><div class="section-head"><h2>竞品/类目基准</h2><span class="muted">同类目与平台的信号对标，不等于市场销量</span></div><table><thead><tr><th>类目</th><th>平台</th><th>信号数</th><th>平均分</th><th>最高分</th><th>平均动能</th><th>平均需求</th><th>评论数</th></tr></thead><tbody id="benchmarks"></tbody></table></section></main><script>
