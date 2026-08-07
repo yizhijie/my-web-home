@@ -30,6 +30,7 @@ def init_db():
         )""")
         conn.execute("ALTER TABLE opportunities ADD COLUMN IF NOT EXISTS comment_count INTEGER NOT NULL DEFAULT 0")
         conn.execute("ALTER TABLE opportunities ADD COLUMN IF NOT EXISTS pain_points TEXT NOT NULL DEFAULT ''")
+        conn.execute("ALTER TABLE opportunities ADD COLUMN IF NOT EXISTS comments_checked_at TIMESTAMPTZ")
         conn.execute("""CREATE TABLE IF NOT EXISTS comments (
           id SERIAL PRIMARY KEY,
           opportunity_id INTEGER NOT NULL REFERENCES opportunities(id) ON DELETE CASCADE,

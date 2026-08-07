@@ -100,9 +100,17 @@ def collect_comments(opportunity_id, post_url):
               GROUP BY pain_label ORDER BY count(*) DESC LIMIT 3""", (opportunity_id,)).fetchall()
             pain = "; ".join(f"{label} ({count})" for label, count in labels if label != "other")
             total = conn.execute("SELECT count(*) FROM comments WHERE opportunity_id=%s", (opportunity_id,)).fetchone()[0]
-            conn.execute("UPDATE opportunities SET comment_count=%s,pain_points=%s WHERE id=%s", (total, pain, opportunity_id))
+            conn.execute("""UPDATE opportunities SET comment_count=%s,pain_points=%s,
+              comments_checked_at=now() WHERE id=%s""", (total, pain, opportunity_id))
     except Exception as exc:
         print(f"comment collection failed for {post_url}: {exc}", flush=True)
+
+
+def pending_comments(category, limit):
+    with psycopg.connect(DB) as conn:
+        return conn.execute("""SELECT id,source_url FROM opportunities
+          WHERE category=%s AND source_url LIKE '%%/video/%%' AND comments_checked_at IS NULL
+          ORDER BY score DESC LIMIT %s""", (category, limit)).fetchall()
 
 
 def snapshot(category):
@@ -122,7 +130,9 @@ def run():
     for keyword, category in KEYWORDS:
         try:
             urls = save_posts(collect(keyword), category)
-            for opportunity_id, post_url in urls[:comment_budget]:
+            existing = pending_comments(category, max(comment_budget - len(urls), 0))
+            candidates = urls + [x for x in existing if x not in urls]
+            for opportunity_id, post_url in candidates[:comment_budget]:
                 collect_comments(opportunity_id, post_url)
                 comment_budget -= 1
             snapshot(category)
