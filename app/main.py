@@ -208,6 +208,26 @@ def pains(limit: int = Query(12, ge=1, le=50)):
     return [{"label": x[0], "count": x[1], "likes": x[2], "example": x[3]} for x in rows]
 
 
+@app.get("/api/pains/{pain_label}")
+def pain_detail(pain_label: str):
+    """Return review evidence behind one pain label for interactive drill-down."""
+    with db() as conn:
+        rows = conn.execute("""SELECT c.comment_text,c.likes,c.replies,c.pain_label,c.comment_url,
+          c.created_at,o.id,o.product,o.category,o.platform,o.score
+          FROM comments c JOIN opportunities o ON o.id=c.opportunity_id
+          WHERE c.pain_label=%s ORDER BY c.likes DESC,c.created_at DESC LIMIT 100""", (pain_label,)).fetchall()
+    comments = []
+    products = {}
+    for row in rows:
+        comment = dict(zip(["text", "likes", "replies", "pain_label", "url", "created_at"], row[:6]))
+        product = dict(zip(["id", "product", "category", "platform", "score"], row[6:]))
+        comment["opportunity"] = product
+        comments.append(comment)
+        products[product["id"]] = product
+    return {"label": pain_label, "count": len(comments), "comments": comments,
+            "opportunities": list(products.values())}
+
+
 @app.get("/api/benchmarks")
 def benchmarks():
     with db() as conn:
