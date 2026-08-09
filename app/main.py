@@ -67,6 +67,20 @@ def init_db():
           started_at TIMESTAMPTZ NOT NULL DEFAULT now(),
           finished_at TIMESTAMPTZ
         )""")
+        conn.execute("ALTER TABLE collector_runs ADD COLUMN IF NOT EXISTS platform TEXT NOT NULL DEFAULT 'TikTok'")
+        conn.execute("ALTER TABLE collector_runs ADD COLUMN IF NOT EXISTS source_kind TEXT NOT NULL DEFAULT 'social'")
+        conn.execute("""CREATE TABLE IF NOT EXISTS source_status (
+          source_key TEXT PRIMARY KEY,
+          display_name TEXT NOT NULL,
+          kind TEXT NOT NULL,
+          enabled BOOLEAN NOT NULL DEFAULT FALSE,
+          configured BOOLEAN NOT NULL DEFAULT FALSE,
+          status TEXT NOT NULL DEFAULT 'pending',
+          rows_collected INTEGER NOT NULL DEFAULT 0,
+          error_message TEXT NOT NULL DEFAULT '',
+          last_run_at TIMESTAMPTZ,
+          updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+        )""")
         conn.execute("""CREATE TABLE IF NOT EXISTS google_trends (
           id SERIAL PRIMARY KEY,
           keyword TEXT NOT NULL,
@@ -259,12 +273,18 @@ def opportunity_detail(opportunity_id: int):
 @app.get("/api/status")
 def status():
     with db() as conn:
-        last = conn.execute("""SELECT keyword,status,new_items,error_message,started_at,finished_at
+        last = conn.execute("""SELECT keyword,status,new_items,error_message,started_at,finished_at,platform,source_kind
           FROM collector_runs ORDER BY started_at DESC LIMIT 1""").fetchone()
+        sources = conn.execute("""SELECT source_key,display_name,kind,enabled,configured,status,
+          rows_collected,error_message,last_run_at,updated_at
+          FROM source_status ORDER BY CASE kind WHEN 'social' THEN 0 WHEN 'search' THEN 1 ELSE 2 END, display_name""").fetchall()
     result = {"app": "ok", "brightdata_configured": bool(os.environ.get("BRIGHTDATA_API_TOKEN")),
-              "google_trends_enabled": os.environ.get("GOOGLE_TRENDS_ENABLED", "false").lower() in {"1", "true", "yes"}, "last_run": None}
+              "google_trends_enabled": os.environ.get("GOOGLE_TRENDS_ENABLED", "false").lower() in {"1", "true", "yes"},
+              "last_run": None, "sources": []}
     if last:
-        result["last_run"] = dict(zip(["keyword", "status", "new_items", "error", "started_at", "finished_at"], last))
+        result["last_run"] = dict(zip(["keyword", "status", "new_items", "error", "started_at", "finished_at", "platform", "source_kind"], last))
+    for row in sources:
+        result["sources"].append(dict(zip(["key", "name", "kind", "enabled", "configured", "status", "rows_collected", "error", "last_run_at", "updated_at"], row)))
     return result
 
 
