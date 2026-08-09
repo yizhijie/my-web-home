@@ -35,6 +35,23 @@ def init_db():
         conn.execute("ALTER TABLE opportunities ADD COLUMN IF NOT EXISTS comment_count INTEGER NOT NULL DEFAULT 0")
         conn.execute("ALTER TABLE opportunities ADD COLUMN IF NOT EXISTS pain_points TEXT NOT NULL DEFAULT ''")
         conn.execute("ALTER TABLE opportunities ADD COLUMN IF NOT EXISTS comments_checked_at TIMESTAMPTZ")
+        conn.execute("""CREATE TABLE IF NOT EXISTS validation_checks (
+          opportunity_id INTEGER PRIMARY KEY REFERENCES opportunities(id) ON DELETE CASCADE,
+          target_price NUMERIC(12,2) NOT NULL DEFAULT 0,
+          product_cost NUMERIC(12,2) NOT NULL DEFAULT 0,
+          inbound_shipping NUMERIC(12,2) NOT NULL DEFAULT 0,
+          platform_fee_pct NUMERIC(5,2) NOT NULL DEFAULT 0,
+          fulfillment_fee NUMERIC(12,2) NOT NULL DEFAULT 0,
+          ad_cost_pct NUMERIC(5,2) NOT NULL DEFAULT 0,
+          return_rate_pct NUMERIC(5,2) NOT NULL DEFAULT 0,
+          other_cost NUMERIC(12,2) NOT NULL DEFAULT 0,
+          competitor_count INTEGER NOT NULL DEFAULT 0,
+          competitor_avg_price NUMERIC(12,2) NOT NULL DEFAULT 0,
+          compliance_risk TEXT NOT NULL DEFAULT 'unknown',
+          seasonality TEXT NOT NULL DEFAULT '',
+          notes TEXT NOT NULL DEFAULT '',
+          updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+        )""")
         conn.execute("""CREATE TABLE IF NOT EXISTS comments (
           id SERIAL PRIMARY KEY,
           opportunity_id INTEGER NOT NULL REFERENCES opportunities(id) ON DELETE CASCADE,
@@ -116,6 +133,22 @@ class Opportunity(BaseModel):
     gap: str
     risk: str
     source_url: str = ""
+
+
+class ValidationInput(BaseModel):
+    target_price: float = Field(ge=0, le=100000)
+    product_cost: float = Field(ge=0, le=100000)
+    inbound_shipping: float = Field(ge=0, le=100000)
+    platform_fee_pct: float = Field(ge=0, le=100)
+    fulfillment_fee: float = Field(ge=0, le=100000)
+    ad_cost_pct: float = Field(ge=0, le=100)
+    return_rate_pct: float = Field(ge=0, le=100)
+    other_cost: float = Field(ge=0, le=100000)
+    competitor_count: int = Field(ge=0, le=1000000)
+    competitor_avg_price: float = Field(ge=0, le=100000)
+    compliance_risk: str = Field(default="unknown", max_length=20)
+    seasonality: str = Field(default="", max_length=200)
+    notes: str = Field(default="", max_length=2000)
 
 
 @app.get("/api/opportunities")
@@ -268,6 +301,77 @@ def opportunity_detail(opportunity_id: int):
     result = dict(zip(keys, row))
     result["comments"] = [dict(zip(comment_keys, x)) for x in comments]
     return result
+
+
+def _validation_result(opportunity_id: int, values: dict):
+    with db() as conn:
+        opportunity = conn.execute("SELECT score,momentum,demand,risk FROM opportunities WHERE id=%s", (opportunity_id,)).fetchone()
+        if not opportunity:
+            raise HTTPException(status_code=404, detail="Opportunity not found")
+        conn.execute("""INSERT INTO validation_checks
+          (opportunity_id,target_price,product_cost,inbound_shipping,platform_fee_pct,fulfillment_fee,
+           ad_cost_pct,return_rate_pct,other_cost,competitor_count,competitor_avg_price,compliance_risk,seasonality,notes,updated_at)
+          VALUES(%(opportunity_id)s,%(target_price)s,%(product_cost)s,%(inbound_shipping)s,%(platform_fee_pct)s,%(fulfillment_fee)s,
+           %(ad_cost_pct)s,%(return_rate_pct)s,%(other_cost)s,%(competitor_count)s,%(competitor_avg_price)s,%(compliance_risk)s,%(seasonality)s,%(notes)s,now())
+          ON CONFLICT(opportunity_id) DO UPDATE SET target_price=EXCLUDED.target_price,product_cost=EXCLUDED.product_cost,
+           inbound_shipping=EXCLUDED.inbound_shipping,platform_fee_pct=EXCLUDED.platform_fee_pct,
+           fulfillment_fee=EXCLUDED.fulfillment_fee,ad_cost_pct=EXCLUDED.ad_cost_pct,return_rate_pct=EXCLUDED.return_rate_pct,
+           other_cost=EXCLUDED.other_cost,competitor_count=EXCLUDED.competitor_count,competitor_avg_price=EXCLUDED.competitor_avg_price,
+           compliance_risk=EXCLUDED.compliance_risk,seasonality=EXCLUDED.seasonality,notes=EXCLUDED.notes,updated_at=now()""", {**values, "opportunity_id": opportunity_id})
+    price = float(values["target_price"])
+    fixed_cost = sum(float(values[k]) for k in ("product_cost", "inbound_shipping", "fulfillment_fee", "other_cost"))
+    variable_rate = (float(values["platform_fee_pct"]) + float(values["ad_cost_pct"]) + float(values["return_rate_pct"])) / 100
+    variable_cost = price * variable_rate
+    total_cost = fixed_cost + variable_cost
+    profit = price - total_cost
+    margin = (profit / price * 100) if price else 0
+    break_even = (fixed_cost / (1 - variable_rate)) if price and variable_rate < 1 else 0
+    score, momentum, demand, opportunity_risk = [int(x or 0) if i < 3 else str(x or "") for i, x in enumerate(opportunity)]
+    compliance = str(values["compliance_risk"] or "unknown").lower()
+    if not price:
+        recommendation = "待填写"
+    elif compliance == "high" or margin < 15 or (score < 55 and margin < 25):
+        recommendation = "暂缓"
+    elif score >= 70 and momentum >= 60 and margin >= 25 and compliance != "high":
+        recommendation = "推荐测试"
+    else:
+        recommendation = "继续观察"
+    reasons = []
+    if score >= 70:
+        reasons.append("社媒信号达到候选线")
+    elif score:
+        reasons.append("社媒信号仍需积累")
+    if margin >= 25:
+        reasons.append("预计单位毛利率达到 25%")
+    elif price:
+        reasons.append("预计毛利率低于 25%，需优化成本或售价")
+    if values["competitor_count"]:
+        reasons.append(f"已记录 {values['competitor_count']} 个竞品")
+    if compliance == "high":
+        reasons.append("合规风险较高，先完成人工核验")
+    return {"input": values, "economics": {"fixed_cost": round(fixed_cost, 2), "variable_rate_pct": round(variable_rate * 100, 2),
+      "variable_cost": round(variable_cost, 2), "total_cost": round(total_cost, 2), "profit": round(profit, 2),
+      "margin_pct": round(margin, 2), "break_even_price": round(break_even, 2)},
+      "signal": {"score": score, "momentum": momentum, "demand": demand, "risk": opportunity_risk},
+      "recommendation": recommendation, "reasons": reasons}
+
+
+@app.get("/api/opportunities/{opportunity_id}/validation")
+def get_validation(opportunity_id: int):
+    defaults = {"target_price": 0, "product_cost": 0, "inbound_shipping": 0, "platform_fee_pct": 0,
+                "fulfillment_fee": 0, "ad_cost_pct": 0, "return_rate_pct": 0, "other_cost": 0,
+                "competitor_count": 0, "competitor_avg_price": 0, "compliance_risk": "unknown", "seasonality": "", "notes": ""}
+    with db() as conn:
+        row = conn.execute("""SELECT target_price,product_cost,inbound_shipping,platform_fee_pct,fulfillment_fee,
+          ad_cost_pct,return_rate_pct,other_cost,competitor_count,competitor_avg_price,compliance_risk,seasonality,notes
+          FROM validation_checks WHERE opportunity_id=%s""", (opportunity_id,)).fetchone()
+    values = defaults if not row else dict(zip(defaults, row))
+    return _validation_result(opportunity_id, values)
+
+
+@app.put("/api/opportunities/{opportunity_id}/validation")
+def save_validation(opportunity_id: int, payload: ValidationInput):
+    return _validation_result(opportunity_id, payload.model_dump())
 
 
 @app.get("/api/status")

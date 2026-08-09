@@ -25,3 +25,13 @@ Bright Data Dataset input schemas are not interchangeable. For each Dataset, che
 Google Trends is a separate optional search source. Set `GOOGLE_TRENDS_ENABLED=true` and use the SERP zone that exists in your Bright Data account (`BRIGHTDATA_SERP_ZONE`). A switch only enables requests; it does not grant zone access. If Bright Data returns an error, the source card and Worker logs show the error and the Google Trends panel remains empty.
 
 The normalized opportunity table is intentionally a signal layer: social attention and review pain points do not prove sales, profit, market size, or product safety. Validate marketplace demand, landed cost, IP, safety, claims, and platform rules before sourcing.
+
+## Product validation workbench
+
+Open an opportunity detail and use **产品验证工作台** to save target price, product cost, inbound shipping, fulfillment, platform fee, advertising rate, return rate, other unit costs, competitor count/average price, compliance risk, seasonality, and notes. The API stores these inputs per opportunity and returns unit profit, margin, total cost, and break-even price. The recommendation is a guardrail:
+
+- `推荐测试`: signal score is strong and modeled margin is at least 25% with no high compliance risk.
+- `继续观察`: evidence or economics is incomplete but not immediately disqualifying.
+- `暂缓`: modeled margin is below 15%, signal is weak, or compliance risk is high.
+
+This is a pre-test unit economics model, not a tax, accounting, investment, or sales forecast.
