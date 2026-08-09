@@ -16,7 +16,7 @@ COLLECT_COMMENTS = os.environ.get("COLLECT_COMMENTS", "true").lower() in {"1", "
 MAX_COMMENT_POSTS = int(os.environ.get("MAX_COMMENT_POSTS_PER_RUN", "3"))
 GOOGLE_TRENDS_ENABLED = os.environ.get("GOOGLE_TRENDS_ENABLED", "false").lower() in {"1", "true", "yes"}
 GOOGLE_TRENDS_KEYWORDS = [x.strip() for x in os.environ.get("GOOGLE_TRENDS_KEYWORDS", "pet cooling mat,walking pad,pantry organizer").split(",") if x.strip()]
-SERP_ZONE = os.environ.get("BRIGHTDATA_SERP_ZONE", "serp_api1")
+SERP_ZONE = (os.environ.get("BRIGHTDATA_SERP_ZONE") or "serp_api1").strip()
 KEYWORDS = [("pet cooling mat", "Pets"), ("under desk walking pad", "Fitness"), ("pantry organizer", "Home")]
 POSTS_URL = "https://api.brightdata.com/datasets/v3/scrape?dataset_id=gd_lu702nij2f790tmv9h&type=discover_new&discover_by=keyword&include_errors=true"
 COMMENTS_URL = "https://api.brightdata.com/datasets/v3/scrape?dataset_id=gd_lkf2st302ap89utw5k&include_errors=true"
