@@ -4,6 +4,7 @@ import re
 import time
 import urllib.request
 import urllib.parse
+import urllib.error
 from datetime import datetime, timezone
 
 import psycopg
@@ -60,8 +61,12 @@ def request_google_trends(keyword):
     data = json.dumps(payload).encode()
     req = urllib.request.Request("https://api.brightdata.com/request", data=data,
       headers={"Authorization": f"Bearer {TOKEN}", "Content-Type": "application/json"}, method="POST")
-    with urllib.request.urlopen(req, timeout=180) as response:
-        return json.loads(response.read().decode()), source_url
+    try:
+        with urllib.request.urlopen(req, timeout=180) as response:
+            return json.loads(response.read().decode()), source_url
+    except urllib.error.HTTPError as exc:
+        body = exc.read().decode("utf-8", errors="replace").strip()
+        raise RuntimeError(f"Bright Data Google Trends HTTP {exc.code}: {body[:600]}") from exc
 
 
 def save_google_trends(keyword):
