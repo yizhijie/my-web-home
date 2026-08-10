@@ -88,6 +88,7 @@ def source_config(slug, market="US"):
         "comments_input_key": (os.environ.get(f"{prefix}_COMMENTS_INPUT_KEY") or "url").strip(),
         "payload_mode": (os.environ.get(f"{prefix}_PAYLOAD_MODE") or ("wrapped" if slug == "tiktok" else "array")).strip().lower(),
         "posts_mode": (os.environ.get(f"{prefix}_POSTS_MODE") or spec.get("posts_mode_default", "discovery")).strip().lower(),
+        "discover_by": (os.environ.get(f"{prefix}_DISCOVER_BY") or ("url" if slug == "tiktok" and (os.environ.get(f"{prefix}_POSTS_MODE") or spec.get("posts_mode_default", "discovery")).strip().lower() == "scrape" else "")).strip().lower(),
         "posts_inputs": posts_inputs,
         "country_field": country_field,
         "market_error": market_error,
@@ -173,10 +174,12 @@ def request_json(url, payload):
     return items
 
 
-def dataset_url(dataset_id, discovery=True):
+def dataset_url(dataset_id, discovery=True, discover_by=""):
     params = {"dataset_id": dataset_id, "format": "json"}
     if discovery:
         params.update({"type": "discover_new", "discover_by": "keyword", "include_errors": "true"})
+    elif discover_by:
+        params.update({"type": "discover_new", "discover_by": discover_by, "include_errors": "true"})
     return "https://api.brightdata.com/datasets/v3/scrape?" + urllib.parse.urlencode(params)
 
 
@@ -187,7 +190,7 @@ def dataset_payload(config, key, value, include_limit=False):
         item = {key: entry}
         if include_limit:
             item["num_of_posts"] = LIMIT
-        if config.get("country_field"):
+        if config.get("country_field") and config.get("discover_by") != "url":
             item[config["country_field"]] = config["market"].lower()
         items.append(item)
     return items if config["payload_mode"] == "array" else {"input": items}
@@ -197,8 +200,9 @@ def collect_platform(config, keyword):
     if not config["posts_dataset_id"]:
         raise SourceNotConfigured(f"{config['name']} posts Dataset ID is not configured")
     values = config["posts_inputs"] or [keyword]
-    return request_json(dataset_url(config["posts_dataset_id"], discovery=config["posts_mode"] != "scrape"),
-                        dataset_payload(config, config["input_key"], values, include_limit=True))
+    discover_by = config.get("discover_by", "")
+    return request_json(dataset_url(config["posts_dataset_id"], discovery=config["posts_mode"] != "scrape", discover_by=discover_by),
+                        dataset_payload(config, config["input_key"], values, include_limit=discover_by != "url"))
 
 
 def request_google_trends(keyword, market="US"):
