@@ -20,6 +20,18 @@ GOOGLE_TRENDS_KEYWORDS = [x.strip() for x in os.environ.get("GOOGLE_TRENDS_KEYWO
 SERP_ZONE = (os.environ.get("BRIGHTDATA_SERP_ZONE") or "serp_api1").strip()
 KEYWORDS = [("pet cooling mat", "Pets"), ("under desk walking pad", "Fitness"), ("pantry organizer", "Home")]
 
+MARKETS = {
+    "US": {"name": "美国", "geo": "US"},
+    "SG": {"name": "新加坡", "geo": "SG"},
+    "MY": {"name": "马来西亚", "geo": "MY"},
+    "TH": {"name": "泰国", "geo": "TH"},
+    "VN": {"name": "越南", "geo": "VN"},
+    "PH": {"name": "菲律宾", "geo": "PH"},
+}
+MARKET_ORDER = ["US", "SG", "MY", "TH", "VN", "PH"]
+COLLECTION_MARKETS = [x.strip().upper() for x in os.environ.get("COLLECTION_MARKETS", "US").split(",")
+                      if x.strip().upper() in MARKETS] or ["US"]
+
 SOURCE_SPECS = {
     "tiktok": {"name": "TikTok", "kind": "social", "posts_default": "gd_lu702nij2f790tmv9h", "comments_default": "gd_lkf2st302ap89utw5k", "input_default": "search_keyword"},
     "instagram": {"name": "Instagram", "kind": "social", "input_default": "url", "posts_mode_default": "scrape"},
@@ -51,14 +63,22 @@ def truthy(value):
     return str(value or "").lower() in {"1", "true", "yes", "on"}
 
 
-def source_config(slug):
+def source_config(slug, market="US"):
     spec = SOURCE_SPECS[slug]
     prefix = f"BRIGHTDATA_{slug.upper()}"
-    posts_id = os.environ.get(f"{prefix}_POSTS_DATASET_ID") or spec.get("posts_default", "")
-    comments_id = os.environ.get(f"{prefix}_COMMENTS_DATASET_ID") or spec.get("comments_default", "")
-    posts_inputs = [x.strip() for x in os.environ.get(f"{prefix}_POSTS_INPUTS", "").split(",") if x.strip()]
+    market = market.upper()
+    posts_id = os.environ.get(f"{prefix}_POSTS_DATASET_ID_{market}") or os.environ.get(f"{prefix}_POSTS_DATASET_ID") or spec.get("posts_default", "")
+    comments_id = os.environ.get(f"{prefix}_COMMENTS_DATASET_ID_{market}") or os.environ.get(f"{prefix}_COMMENTS_DATASET_ID") or spec.get("comments_default", "")
+    market_inputs = os.environ.get(f"{prefix}_POSTS_INPUTS_{market}")
+    posts_inputs = [x.strip() for x in (market_inputs if market_inputs is not None else os.environ.get(f"{prefix}_POSTS_INPUTS", "")).split(",") if x.strip()]
+    country_field = (os.environ.get(f"{prefix}_COUNTRY_FIELD") or "").strip()
+    market_error = ""
+    has_market_inputs = market_inputs is not None and bool(posts_inputs)
+    if market != "US" and spec["kind"] == "social" and not country_field and not has_market_inputs:
+        market_error = f"当前 {spec['name']} Dataset 未配置市场字段；请配置该市场的 URL Dataset 输入后再采集"
     return {
         "slug": slug,
+        "market": market,
         "name": spec["name"],
         "kind": spec["kind"],
         "enabled": slug in ENABLED_PLATFORMS,
@@ -69,6 +89,8 @@ def source_config(slug):
         "payload_mode": (os.environ.get(f"{prefix}_PAYLOAD_MODE") or ("wrapped" if slug == "tiktok" else "array")).strip().lower(),
         "posts_mode": (os.environ.get(f"{prefix}_POSTS_MODE") or spec.get("posts_mode_default", "discovery")).strip().lower(),
         "posts_inputs": posts_inputs,
+        "country_field": country_field,
+        "market_error": market_error,
     }
 
 
@@ -88,8 +110,17 @@ def ensure_worker_schema():
             with psycopg.connect(DB) as conn:
                 conn.execute("ALTER TABLE collector_runs ADD COLUMN IF NOT EXISTS platform TEXT NOT NULL DEFAULT 'TikTok'")
                 conn.execute("ALTER TABLE collector_runs ADD COLUMN IF NOT EXISTS source_kind TEXT NOT NULL DEFAULT 'social'")
+                conn.execute("ALTER TABLE collector_runs ADD COLUMN IF NOT EXISTS market TEXT NOT NULL DEFAULT 'US'")
+                conn.execute("ALTER TABLE opportunities ADD COLUMN IF NOT EXISTS market TEXT NOT NULL DEFAULT 'US'")
+                conn.execute("ALTER TABLE trend_snapshots ADD COLUMN IF NOT EXISTS market TEXT NOT NULL DEFAULT 'US'")
+                conn.execute("ALTER TABLE trend_snapshots DROP CONSTRAINT IF EXISTS trend_snapshots_snapshot_date_category_platform_key")
+                conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS trend_snapshots_market_key ON trend_snapshots(snapshot_date, market, category, platform)")
+                conn.execute("ALTER TABLE google_trends ADD COLUMN IF NOT EXISTS region TEXT NOT NULL DEFAULT 'US'")
+                conn.execute("ALTER TABLE google_trends DROP CONSTRAINT IF EXISTS google_trends_keyword_trend_date_related_query_key")
+                conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS google_trends_region_key ON google_trends(keyword, region, trend_date, related_query)")
                 conn.execute("""CREATE TABLE IF NOT EXISTS source_status (
-                  source_key TEXT PRIMARY KEY,
+                  source_key TEXT NOT NULL,
+                  market TEXT NOT NULL DEFAULT 'US',
                   display_name TEXT NOT NULL,
                   kind TEXT NOT NULL,
                   enabled BOOLEAN NOT NULL DEFAULT FALSE,
@@ -100,6 +131,9 @@ def ensure_worker_schema():
                   last_run_at TIMESTAMPTZ,
                   updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
                 )""")
+                conn.execute("ALTER TABLE source_status ADD COLUMN IF NOT EXISTS market TEXT NOT NULL DEFAULT 'US'")
+                conn.execute("ALTER TABLE source_status DROP CONSTRAINT IF EXISTS source_status_pkey")
+                conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS source_status_market_key ON source_status(source_key, market)")
             return
         except Exception:
             time.sleep(2)
@@ -109,13 +143,13 @@ def ensure_worker_schema():
 def mark_source(config, status, rows=0, error=""):
     with psycopg.connect(DB) as conn:
         conn.execute("""INSERT INTO source_status
-          (source_key,display_name,kind,enabled,configured,status,rows_collected,error_message,last_run_at,updated_at)
-          VALUES(%s,%s,%s,%s,%s,%s,%s,%s,now(),now())
-          ON CONFLICT(source_key) DO UPDATE SET display_name=EXCLUDED.display_name,kind=EXCLUDED.kind,
+          (source_key,market,display_name,kind,enabled,configured,status,rows_collected,error_message,last_run_at,updated_at)
+          VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s,now(),now())
+          ON CONFLICT(source_key,market) DO UPDATE SET display_name=EXCLUDED.display_name,kind=EXCLUDED.kind,
             enabled=EXCLUDED.enabled,configured=EXCLUDED.configured,status=EXCLUDED.status,
             rows_collected=EXCLUDED.rows_collected,error_message=EXCLUDED.error_message,
             last_run_at=EXCLUDED.last_run_at,updated_at=now()""",
-                      (config["slug"], config["name"], config["kind"], config["enabled"],
+                      (config["slug"], config["market"], config["name"], config["kind"], config["enabled"],
                        bool(config.get("configured", config["posts_dataset_id"])), status, rows, str(error or "")[:500]))
 
 
@@ -153,6 +187,8 @@ def dataset_payload(config, key, value, include_limit=False):
         item = {key: entry}
         if include_limit:
             item["num_of_posts"] = LIMIT
+        if config.get("country_field"):
+            item[config["country_field"]] = config["market"].lower()
         items.append(item)
     return items if config["payload_mode"] == "array" else {"input": items}
 
@@ -165,9 +201,10 @@ def collect_platform(config, keyword):
                         dataset_payload(config, config["input_key"], values, include_limit=True))
 
 
-def request_google_trends(keyword):
+def request_google_trends(keyword, market="US"):
+    market = market.upper()
     encoded = urllib.parse.quote_plus(keyword)
-    source_url = f"https://trends.google.com/trends/explore?q={encoded}&geo=US&brd_trends=timeseries,geo_map&brd_json=1"
+    source_url = f"https://trends.google.com/trends/explore?q={encoded}&geo={market}&brd_trends=timeseries,geo_map&brd_json=1"
     payload = {"zone": SERP_ZONE, "url": source_url, "format": "raw"}
     data = json.dumps(payload).encode()
     req = urllib.request.Request("https://api.brightdata.com/request", data=data,
@@ -180,8 +217,9 @@ def request_google_trends(keyword):
         raise RuntimeError(f"Bright Data Google Trends HTTP {exc.code}: {body[:600]}") from exc
 
 
-def save_google_trends(keyword):
-    parsed, source_url = request_google_trends(keyword)
+def save_google_trends(keyword, market="US"):
+    market = market.upper()
+    parsed, source_url = request_google_trends(keyword, market)
     timeline, related = [], []
     for widget in parsed.get("widgets", []):
         data = widget.get("data", {}).get("default", {})
@@ -198,18 +236,18 @@ def save_google_trends(keyword):
                 interest = int((point.get("value") or [0])[0] or 0)
             except (TypeError, ValueError, OverflowError):
                 continue
-            conn.execute("""INSERT INTO google_trends(keyword,trend_date,interest,source_url)
-              VALUES(%s,%s,%s,%s) ON CONFLICT(keyword,trend_date,related_query) DO UPDATE SET interest=EXCLUDED.interest""",
-              (keyword, trend_date, interest, source_url))
+            conn.execute("""INSERT INTO google_trends(keyword,region,trend_date,interest,source_url)
+              VALUES(%s,%s,%s,%s,%s) ON CONFLICT(keyword,region,trend_date,related_query) DO UPDATE SET interest=EXCLUDED.interest""",
+              (keyword, market, trend_date, interest, source_url))
             saved += 1
         for item in related[:30]:
             query = str(item.get("query") or item.get("keyword") or "")[:200]
             if not query:
                 continue
             value = int(item.get("value") or 0)
-            conn.execute("""INSERT INTO google_trends(keyword,trend_date,interest,related_query,related_value,source_url)
-              VALUES(%s,CURRENT_DATE,0,%s,%s,%s) ON CONFLICT(keyword,trend_date,related_query) DO UPDATE SET related_value=EXCLUDED.related_value""",
-              (keyword, query, value, source_url))
+            conn.execute("""INSERT INTO google_trends(keyword,region,trend_date,interest,related_query,related_value,source_url)
+              VALUES(%s,%s,CURRENT_DATE,0,%s,%s,%s) ON CONFLICT(keyword,region,trend_date,related_query) DO UPDATE SET related_value=EXCLUDED.related_value""",
+              (keyword, market, query, value, source_url))
             saved += 1
     return saved
 
@@ -273,12 +311,12 @@ def save_posts(items, category, config, keyword):
             score = min(100, round(momentum * .45 + demand * .30 + 25))
             product = extract_text(item, f"{config['name']} · {keyword}")
             row = conn.execute("""INSERT INTO opportunities
-              (product,category,platform,score,momentum,cross_platform,demand,gap,risk,source_url,comment_count)
+              (product,category,platform,score,momentum,cross_platform,demand,gap,risk,source_url,comment_count,market)
               SELECT %s,%s,%s,%s,%s,%s,%s,'Review comments and competitor gaps before sourcing',
-                'Validate IP, safety and product claims',%s,%s
-              WHERE NOT EXISTS (SELECT 1 FROM opportunities WHERE source_url=%s)
+                'Validate IP, safety and product claims',%s,%s,%s
+              WHERE NOT EXISTS (SELECT 1 FROM opportunities WHERE source_url=%s AND market=%s)
               RETURNING id, source_url""",
-              (product, category, config["name"], score, momentum, 25, demand, url, comments, url)).fetchone()
+              (product, category, config["name"], score, momentum, 25, demand, url, comments, config["market"], url, config["market"])).fetchone()
             if row:
                 urls.append((row[0], row[1]))
     return urls
@@ -313,26 +351,30 @@ def collect_comments(opportunity_id, post_url, config):
         print(f"comment collection failed for {config['name']} {post_url}: {exc}", flush=True)
 
 
-def pending_comments(platform, limit):
+def pending_comments(platform, market, limit):
     with psycopg.connect(DB) as conn:
         return conn.execute("""SELECT id,source_url FROM opportunities
-          WHERE platform=%s AND source_url IS NOT NULL AND source_url<>'' AND comments_checked_at IS NULL
-          ORDER BY score DESC LIMIT %s""", (platform, limit)).fetchall()
+          WHERE platform=%s AND market=%s AND source_url IS NOT NULL AND source_url<>'' AND comments_checked_at IS NULL
+          ORDER BY score DESC LIMIT %s""", (platform, market, limit)).fetchall()
 
 
-def snapshot(category):
+def snapshot(category, market):
     with psycopg.connect(DB) as conn:
-        conn.execute("""INSERT INTO trend_snapshots(snapshot_date,category,platform,opportunity_count,avg_score,avg_momentum,avg_demand,comment_count)
-          SELECT CURRENT_DATE,category,platform,count(*),round(avg(score)),round(avg(momentum)),round(avg(demand)),coalesce(sum(comment_count),0)
-          FROM opportunities WHERE category=%s GROUP BY category,platform
-          ON CONFLICT (snapshot_date,category,platform) DO UPDATE SET opportunity_count=EXCLUDED.opportunity_count,
+        conn.execute("""INSERT INTO trend_snapshots(snapshot_date,market,category,platform,opportunity_count,avg_score,avg_momentum,avg_demand,comment_count)
+          SELECT CURRENT_DATE,%s,category,platform,count(*),round(avg(score)),round(avg(momentum)),round(avg(demand)),coalesce(sum(comment_count),0)
+          FROM opportunities WHERE category=%s AND market=%s GROUP BY category,platform
+          ON CONFLICT (snapshot_date,market,category,platform) DO UPDATE SET opportunity_count=EXCLUDED.opportunity_count,
             avg_score=EXCLUDED.avg_score,avg_momentum=EXCLUDED.avg_momentum,avg_demand=EXCLUDED.avg_demand,
-            comment_count=EXCLUDED.comment_count""", (category,))
+            comment_count=EXCLUDED.comment_count""", (market, category, market))
 
 
 def run_platform(config, comment_budget):
     if not config["enabled"]:
         mark_source(config, "disabled")
+        return comment_budget
+    if config.get("market_error"):
+        mark_source(config, "pending", error=config["market_error"])
+        print(f"{config['name']} {config['market']} skipped: {config['market_error']}", flush=True)
         return comment_budget
     if not config["posts_dataset_id"]:
         mark_source(config, "pending", error="Bright Data Posts Dataset ID is not configured")
@@ -349,16 +391,16 @@ def run_platform(config, comment_budget):
         started = None
         try:
             with psycopg.connect(DB) as conn:
-                started = conn.execute("""INSERT INTO collector_runs(platform,source_kind,keyword,status)
-                  VALUES(%s,%s,%s,'running') RETURNING id""", (config["name"], config["kind"], keyword)).fetchone()[0]
+                started = conn.execute("""INSERT INTO collector_runs(platform,source_kind,keyword,market,status)
+                  VALUES(%s,%s,%s,%s,'running') RETURNING id""", (config["name"], config["kind"], keyword, config["market"])).fetchone()[0]
             urls = save_posts(collect_platform(config, keyword), category, config, keyword)
             total_new += len(urls)
-            existing = pending_comments(config["name"], max(comment_budget[0] - len(urls), 0))
+            existing = pending_comments(config["name"], config["market"], max(comment_budget[0] - len(urls), 0))
             candidates = urls + [x for x in existing if x not in urls]
             for opportunity_id, post_url in candidates[:comment_budget[0]]:
                 collect_comments(opportunity_id, post_url, config)
                 comment_budget[0] -= 1
-            snapshot(category)
+            snapshot(category, config["market"])
             with psycopg.connect(DB) as conn:
                 conn.execute("UPDATE collector_runs SET status='success',new_items=%s,finished_at=now() WHERE id=%s", (len(urls), started))
             print(f"collected {config['name']} {keyword}: {len(urls)} new posts", flush=True)
@@ -372,9 +414,10 @@ def run_platform(config, comment_budget):
     return comment_budget
 
 
-def run_google_trends():
+def run_google_trends(market="US"):
+    market = market.upper()
     config = {"slug": "google_trends", "name": "Google Trends", "kind": "search", "enabled": GOOGLE_TRENDS_ENABLED,
-              "posts_dataset_id": SERP_ZONE, "configured": bool(SERP_ZONE)}
+              "posts_dataset_id": SERP_ZONE, "configured": bool(SERP_ZONE), "market": market}
     if not GOOGLE_TRENDS_ENABLED:
         mark_source(config, "disabled")
         return
@@ -383,21 +426,28 @@ def run_google_trends():
     errors = []
     for keyword in GOOGLE_TRENDS_KEYWORDS:
         try:
-            saved += save_google_trends(keyword)
-            print(f"collected Google Trends: {keyword}", flush=True)
+            saved += save_google_trends(keyword, market)
+            print(f"collected Google Trends {market}: {keyword}", flush=True)
         except Exception as exc:
             errors.append(str(exc))
             print(f"Google Trends failed for {keyword}: {exc}", flush=True)
     mark_source(config, "error" if errors else "success", saved, "; ".join(errors))
 
 
+def run_market(market):
+    market = market.upper()
+    print(f"starting market {market}", flush=True)
+    run_google_trends(market)
+    comment_budget = [MAX_COMMENT_POSTS]
+    for slug in SOURCE_ORDER:
+        comment_budget = run_platform(source_config(slug, market), comment_budget)
+
+
 def run():
     if not TOKEN:
         raise RuntimeError("BRIGHTDATA_API_TOKEN is missing")
-    run_google_trends()
-    comment_budget = [MAX_COMMENT_POSTS]
-    for slug in SOURCE_ORDER:
-        comment_budget = [run_platform(source_config(slug), comment_budget)]
+    for market in COLLECTION_MARKETS:
+        run_market(market)
 
 
 wait_for_db()

@@ -16,6 +16,12 @@ In GitHub: **Settings → Actions → Runners → New self-hosted runner**, choo
 
 `COLLECTION_INTERVAL_SECONDS=86400` runs once per day. `POSTS_PER_KEYWORD=3` controls discovery volume. `COLLECT_COMMENTS=true` enables TikTok comment collection, while `MAX_COMMENT_POSTS_PER_RUN=3` caps comment calls per daily run for the free quota. These settings belong in `/opt/trend-radar/.env` on the ECS only.
 
+## Market switch
+
+The dashboard's top-right market selector supports US plus Singapore, Malaysia, Thailand, Vietnam and the Philippines. Existing rows are migrated to `US`. The Worker reads `COLLECTION_MARKETS` and stores the market on opportunities, snapshots, source health and Google Trends rows. Google Trends uses the selected market's `geo` value, so set `COLLECTION_MARKETS=US,SG,MY,TH,VN,PH` on the server when you want separate regional trend series on the next run (this increases Bright Data usage).
+
+TikTok's default discover-by-keyword Dataset accepts `search_keyword` and `num_of_posts`, but does not expose a country input. The UI therefore keeps the Southeast Asia TikTok entries visible while marking them `待接入` until a localized TikTok Dataset or per-market URL inputs are configured. Do not label global keyword results as country-specific data. For a localized URL Dataset, set `BRIGHTDATA_TIKTOK_POSTS_MODE=scrape`, `BRIGHTDATA_TIKTOK_POSTS_INPUT_KEY=url`, and provide market-specific inputs such as `BRIGHTDATA_TIKTOK_POSTS_INPUTS_SG`.
+
 ## Multi-source Bright Data collection
 
 TikTok is enabled by default because the starter deployment already has its keyword-discovery Dataset IDs. The Worker also has adapters for Instagram, YouTube, Facebook, X, Reddit, Amazon and Google Maps. Enable sources with `SOCIAL_PLATFORMS_ENABLED=tiktok,instagram,youtube` and fill the matching `BRIGHTDATA_<SOURCE>_POSTS_DATASET_ID` and (when available) `..._COMMENTS_DATASET_ID` values in the server `.env`. The dashboard reports each source as `正常`, `运行中`, `失败`, `待配置`, or `未启用`.

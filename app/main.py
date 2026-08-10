@@ -14,6 +14,27 @@ from pydantic import BaseModel, Field
 DATABASE_URL = os.environ["DATABASE_URL"]
 app = FastAPI(title="US Trend Radar")
 
+MARKETS = {
+    "US": {"name": "美国", "name_en": "United States", "group": "North America", "geo": "US"},
+    "SG": {"name": "新加坡", "name_en": "Singapore", "group": "Southeast Asia", "geo": "SG"},
+    "MY": {"name": "马来西亚", "name_en": "Malaysia", "group": "Southeast Asia", "geo": "MY"},
+    "TH": {"name": "泰国", "name_en": "Thailand", "group": "Southeast Asia", "geo": "TH"},
+    "VN": {"name": "越南", "name_en": "Vietnam", "group": "Southeast Asia", "geo": "VN"},
+    "PH": {"name": "菲律宾", "name_en": "Philippines", "group": "Southeast Asia", "geo": "PH"},
+}
+MARKET_ORDER = ["US", "SG", "MY", "TH", "VN", "PH"]
+
+
+def normalize_market(value: str | None) -> str:
+    code = str(value or "US").strip().upper()
+    return code if code in MARKETS else "US"
+
+
+def enabled_markets() -> set[str]:
+    configured = os.environ.get("COLLECTION_MARKETS", "US")
+    markets = {normalize_market(x) for x in configured.split(",") if x.strip()}
+    return markets or {"US"}
+
 
 @contextmanager
 def db():
@@ -35,6 +56,7 @@ def init_db():
         conn.execute("ALTER TABLE opportunities ADD COLUMN IF NOT EXISTS comment_count INTEGER NOT NULL DEFAULT 0")
         conn.execute("ALTER TABLE opportunities ADD COLUMN IF NOT EXISTS pain_points TEXT NOT NULL DEFAULT ''")
         conn.execute("ALTER TABLE opportunities ADD COLUMN IF NOT EXISTS comments_checked_at TIMESTAMPTZ")
+        conn.execute("ALTER TABLE opportunities ADD COLUMN IF NOT EXISTS market TEXT NOT NULL DEFAULT 'US'")
         conn.execute("""CREATE TABLE IF NOT EXISTS validation_checks (
           opportunity_id INTEGER PRIMARY KEY REFERENCES opportunities(id) ON DELETE CASCADE,
           target_price NUMERIC(12,2) NOT NULL DEFAULT 0,
@@ -66,6 +88,7 @@ def init_db():
         conn.execute("""CREATE TABLE IF NOT EXISTS trend_snapshots (
           id SERIAL PRIMARY KEY,
           snapshot_date DATE NOT NULL DEFAULT CURRENT_DATE,
+          market TEXT NOT NULL DEFAULT 'US',
           category TEXT NOT NULL,
           platform TEXT NOT NULL,
           opportunity_count INTEGER NOT NULL,
@@ -75,6 +98,9 @@ def init_db():
           comment_count INTEGER NOT NULL DEFAULT 0,
           UNIQUE(snapshot_date, category, platform)
         )""")
+        conn.execute("ALTER TABLE trend_snapshots ADD COLUMN IF NOT EXISTS market TEXT NOT NULL DEFAULT 'US'")
+        conn.execute("ALTER TABLE trend_snapshots DROP CONSTRAINT IF EXISTS trend_snapshots_snapshot_date_category_platform_key")
+        conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS trend_snapshots_market_key ON trend_snapshots(snapshot_date, market, category, platform)")
         conn.execute("""CREATE TABLE IF NOT EXISTS collector_runs (
           id SERIAL PRIMARY KEY,
           keyword TEXT NOT NULL,
@@ -86,8 +112,10 @@ def init_db():
         )""")
         conn.execute("ALTER TABLE collector_runs ADD COLUMN IF NOT EXISTS platform TEXT NOT NULL DEFAULT 'TikTok'")
         conn.execute("ALTER TABLE collector_runs ADD COLUMN IF NOT EXISTS source_kind TEXT NOT NULL DEFAULT 'social'")
+        conn.execute("ALTER TABLE collector_runs ADD COLUMN IF NOT EXISTS market TEXT NOT NULL DEFAULT 'US'")
         conn.execute("""CREATE TABLE IF NOT EXISTS source_status (
           source_key TEXT PRIMARY KEY,
+          market TEXT NOT NULL DEFAULT 'US',
           display_name TEXT NOT NULL,
           kind TEXT NOT NULL,
           enabled BOOLEAN NOT NULL DEFAULT FALSE,
@@ -98,6 +126,9 @@ def init_db():
           last_run_at TIMESTAMPTZ,
           updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
         )""")
+        conn.execute("ALTER TABLE source_status ADD COLUMN IF NOT EXISTS market TEXT NOT NULL DEFAULT 'US'")
+        conn.execute("ALTER TABLE source_status DROP CONSTRAINT IF EXISTS source_status_pkey")
+        conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS source_status_market_key ON source_status(source_key, market)")
         conn.execute("""CREATE TABLE IF NOT EXISTS google_trends (
           id SERIAL PRIMARY KEY,
           keyword TEXT NOT NULL,
@@ -110,6 +141,9 @@ def init_db():
           created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
           UNIQUE(keyword, trend_date, related_query)
         )""")
+        conn.execute("ALTER TABLE google_trends ADD COLUMN IF NOT EXISTS region TEXT NOT NULL DEFAULT 'US'")
+        conn.execute("ALTER TABLE google_trends DROP CONSTRAINT IF EXISTS google_trends_keyword_trend_date_related_query_key")
+        conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS google_trends_region_key ON google_trends(keyword, region, trend_date, related_query)")
         # Remove only the three known seed rows. Live Bright Data rows have a source URL.
         conn.execute("""DELETE FROM opportunities
           WHERE source_url = '' AND product IN (
@@ -153,6 +187,7 @@ class ValidationInput(BaseModel):
 
 @app.get("/api/opportunities")
 def list_opportunities(
+    market: str = "US",
     category: str = "",
     platform: str = "",
     q: str = "",
@@ -162,8 +197,9 @@ def list_opportunities(
     risk: str = "",
     sort: str = "score",
 ):
-    clauses = ["score >= %s"]
-    params: list[object] = [min_score]
+    market = normalize_market(market)
+    clauses = ["market = %s", "score >= %s"]
+    params: list[object] = [market, min_score]
     if category:
         clauses.append("category = %s")
         params.append(category)
@@ -190,13 +226,13 @@ def list_opportunities(
              "demand": "demand DESC, score DESC", "comments": "comment_count DESC, score DESC",
              "recent": "created_at DESC"}.get(sort, "score DESC, created_at DESC")
     query = f"""SELECT id,product,category,platform,score,momentum,cross_platform,
-      demand,gap,risk,source_url,comment_count,pain_points,created_at
+      demand,gap,risk,source_url,comment_count,pain_points,created_at,market
       FROM opportunities WHERE {' AND '.join(clauses)}
       ORDER BY {order} LIMIT 200"""
     with db() as conn:
         rows = conn.execute(query, params).fetchall()
     keys = ["id", "product", "category", "platform", "score", "momentum", "cross_platform",
-            "demand", "gap", "risk", "source_url", "comment_count", "pain_points", "created_at"]
+            "demand", "gap", "risk", "source_url", "comment_count", "pain_points", "created_at", "market"]
     result = []
     for row in rows:
         item = dict(zip(keys, row))
@@ -206,63 +242,75 @@ def list_opportunities(
 
 
 @app.get("/api/summary")
-def summary():
+def summary(market: str = "US"):
+    market = normalize_market(market)
     with db() as conn:
         total, avg, high, comments, today = conn.execute(
             """SELECT count(*), coalesce(round(avg(score)),0),
             count(*) FILTER (WHERE score>=70), coalesce(sum(comment_count),0),
             count(*) FILTER (WHERE created_at >= CURRENT_DATE)
-            FROM opportunities"""
+            FROM opportunities WHERE market=%s""", (market,)
         ).fetchone()
         categories = conn.execute(
-            "SELECT category, count(*) FROM opportunities GROUP BY category ORDER BY count(*) DESC"
+            "SELECT category, count(*) FROM opportunities WHERE market=%s GROUP BY category ORDER BY count(*) DESC", (market,)
         ).fetchall()
         platforms = conn.execute(
-            "SELECT platform, count(*) FROM opportunities GROUP BY platform ORDER BY count(*) DESC"
+            "SELECT platform, count(*) FROM opportunities WHERE market=%s GROUP BY platform ORDER BY count(*) DESC", (market,)
         ).fetchall()
     return {
         "total": total, "average_score": avg, "high_priority": high, "today_new": today,
         "comment_count": comments,
         "categories": [{"name": x[0], "count": x[1]} for x in categories],
-        "platforms": [{"name": x[0], "count": x[1]} for x in platforms],
+        "platforms": [{"name": x[0], "count": x[1]} for x in platforms], "market": market,
     }
 
 
 @app.get("/api/filters")
-def filters():
+def filters(market: str = "US"):
+    market = normalize_market(market)
     with db() as conn:
-        categories = conn.execute("SELECT DISTINCT category FROM opportunities ORDER BY category").fetchall()
-        platforms = conn.execute("SELECT DISTINCT platform FROM opportunities ORDER BY platform").fetchall()
+        categories = conn.execute("SELECT DISTINCT category FROM opportunities WHERE market=%s ORDER BY category", (market,)).fetchall()
+        platforms = conn.execute("SELECT DISTINCT platform FROM opportunities WHERE market=%s ORDER BY platform", (market,)).fetchall()
     return {"categories": [x[0] for x in categories], "platforms": [x[0] for x in platforms]}
 
 
+@app.get("/api/markets")
+def markets():
+    enabled = enabled_markets()
+    return [{"code": code, **MARKETS[code], "collection_enabled": code in enabled} for code in MARKET_ORDER]
+
+
 @app.get("/api/trends")
-def trends(days: int = Query(30, ge=7, le=180)):
+def trends(days: int = Query(30, ge=7, le=180), market: str = "US"):
+    market = normalize_market(market)
     with db() as conn:
         rows = conn.execute("""SELECT snapshot_date,category,platform,opportunity_count,
           avg_score,avg_momentum,avg_demand,comment_count
-          FROM trend_snapshots WHERE snapshot_date >= CURRENT_DATE - (%s * INTERVAL '1 day')
-          ORDER BY snapshot_date ASC, category, platform""", (days,)).fetchall()
+          FROM trend_snapshots WHERE market=%s AND snapshot_date >= CURRENT_DATE - (%s * INTERVAL '1 day')
+          ORDER BY snapshot_date ASC, category, platform""", (market, days)).fetchall()
     keys = ["date", "category", "platform", "opportunity_count", "avg_score", "avg_momentum", "avg_demand", "comment_count"]
     return [dict(zip(keys, row)) for row in rows]
 
 
 @app.get("/api/pains")
-def pains(limit: int = Query(12, ge=1, le=50)):
+def pains(limit: int = Query(12, ge=1, le=50), market: str = "US"):
+    market = normalize_market(market)
     with db() as conn:
         rows = conn.execute("""SELECT pain_label, count(*), coalesce(sum(likes),0),
-          max(comment_text) FROM comments GROUP BY pain_label ORDER BY count(*) DESC LIMIT %s""", (limit,)).fetchall()
+          max(comment_text) FROM comments c JOIN opportunities o ON o.id=c.opportunity_id
+          WHERE o.market=%s GROUP BY pain_label ORDER BY count(*) DESC LIMIT %s""", (market, limit)).fetchall()
     return [{"label": x[0], "count": x[1], "likes": x[2], "example": x[3]} for x in rows]
 
 
 @app.get("/api/pains/{pain_label}")
-def pain_detail(pain_label: str):
+def pain_detail(pain_label: str, market: str = "US"):
     """Return review evidence behind one pain label for interactive drill-down."""
+    market = normalize_market(market)
     with db() as conn:
         rows = conn.execute("""SELECT c.comment_text,c.likes,c.replies,c.pain_label,c.comment_url,
           c.created_at,o.id,o.product,o.category,o.platform,o.score
           FROM comments c JOIN opportunities o ON o.id=c.opportunity_id
-          WHERE c.pain_label=%s ORDER BY c.likes DESC,c.created_at DESC LIMIT 100""", (pain_label,)).fetchall()
+          WHERE c.pain_label=%s AND o.market=%s ORDER BY c.likes DESC,c.created_at DESC LIMIT 100""", (pain_label, market)).fetchall()
     comments = []
     products = {}
     for row in rows:
@@ -276,11 +324,12 @@ def pain_detail(pain_label: str):
 
 
 @app.get("/api/benchmarks")
-def benchmarks():
+def benchmarks(market: str = "US"):
+    market = normalize_market(market)
     with db() as conn:
         rows = conn.execute("""SELECT category,platform,count(*),round(avg(score)),
           max(score),round(avg(momentum)),round(avg(demand)),coalesce(sum(comment_count),0)
-          FROM opportunities GROUP BY category,platform ORDER BY avg(score) DESC""").fetchall()
+          FROM opportunities WHERE market=%s GROUP BY category,platform ORDER BY avg(score) DESC""", (market,)).fetchall()
     keys = ["category", "platform", "opportunity_count", "avg_score", "top_score", "avg_momentum", "avg_demand", "comments"]
     return [dict(zip(keys, row)) for row in rows]
 
@@ -289,14 +338,14 @@ def benchmarks():
 def opportunity_detail(opportunity_id: int):
     with db() as conn:
         row = conn.execute("""SELECT id,product,category,platform,score,momentum,cross_platform,
-          demand,gap,risk,source_url,comment_count,pain_points,created_at
+          demand,gap,risk,source_url,comment_count,pain_points,created_at,market
           FROM opportunities WHERE id=%s""", (opportunity_id,)).fetchone()
         if not row:
             raise HTTPException(status_code=404, detail="Opportunity not found")
         comments = conn.execute("""SELECT comment_text,likes,replies,pain_label,comment_url,created_at
           FROM comments WHERE opportunity_id=%s ORDER BY likes DESC, created_at DESC LIMIT 30""", (opportunity_id,)).fetchall()
     keys = ["id", "product", "category", "platform", "score", "momentum", "cross_platform", "demand",
-            "gap", "risk", "source_url", "comment_count", "pain_points", "created_at"]
+            "gap", "risk", "source_url", "comment_count", "pain_points", "created_at", "market"]
     comment_keys = ["text", "likes", "replies", "pain_label", "url", "created_at"]
     result = dict(zip(keys, row))
     result["comments"] = [dict(zip(comment_keys, x)) for x in comments]
@@ -375,51 +424,58 @@ def save_validation(opportunity_id: int, payload: ValidationInput):
 
 
 @app.get("/api/status")
-def status():
+def status(market: str = "US"):
+    market = normalize_market(market)
     with db() as conn:
         last = conn.execute("""SELECT keyword,status,new_items,error_message,started_at,finished_at,platform,source_kind
-          FROM collector_runs ORDER BY started_at DESC LIMIT 1""").fetchone()
-        sources = conn.execute("""SELECT source_key,display_name,kind,enabled,configured,status,
+          FROM collector_runs WHERE market=%s ORDER BY started_at DESC LIMIT 1""", (market,)).fetchone()
+        sources = conn.execute("""SELECT source_key,market,display_name,kind,enabled,configured,status,
           rows_collected,error_message,last_run_at,updated_at
-          FROM source_status ORDER BY CASE kind WHEN 'social' THEN 0 WHEN 'search' THEN 1 ELSE 2 END, display_name""").fetchall()
+          FROM source_status WHERE market=%s
+          ORDER BY CASE kind WHEN 'social' THEN 0 WHEN 'search' THEN 1 ELSE 2 END, display_name""", (market,)).fetchall()
     result = {"app": "ok", "brightdata_configured": bool(os.environ.get("BRIGHTDATA_API_TOKEN")),
               "google_trends_enabled": os.environ.get("GOOGLE_TRENDS_ENABLED", "false").lower() in {"1", "true", "yes"},
-              "last_run": None, "sources": []}
+              "last_run": None, "sources": [], "market": market,
+              "market_collection_enabled": market in enabled_markets()}
     if last:
         result["last_run"] = dict(zip(["keyword", "status", "new_items", "error", "started_at", "finished_at", "platform", "source_kind"], last))
     for row in sources:
-        result["sources"].append(dict(zip(["key", "name", "kind", "enabled", "configured", "status", "rows_collected", "error", "last_run_at", "updated_at"], row)))
+        result["sources"].append(dict(zip(["key", "market", "name", "kind", "enabled", "configured", "status", "rows_collected", "error", "last_run_at", "updated_at"], row)))
     return result
 
 
 @app.get("/api/google-trends")
-def google_trends(days: int = Query(30, ge=1, le=90)):
+def google_trends(days: int = Query(30, ge=1, le=90), market: str = "US"):
+    market = normalize_market(market)
     with db() as conn:
         rows = conn.execute("""SELECT keyword,region,trend_date,interest,related_query,related_value,source_url
-          FROM google_trends WHERE trend_date >= CURRENT_DATE - (%s * INTERVAL '1 day')
-          ORDER BY trend_date DESC, interest DESC, related_value DESC LIMIT 300""", (days,)).fetchall()
+          FROM google_trends WHERE region=%s AND trend_date >= CURRENT_DATE - (%s * INTERVAL '1 day')
+          ORDER BY trend_date DESC, interest DESC, related_value DESC LIMIT 300""", (market, days)).fetchall()
     keys = ["keyword", "region", "date", "interest", "related_query", "related_value", "source_url"]
     return [dict(zip(keys, row)) for row in rows]
 
 
 @app.get("/api/reports/{report_type}")
-def report(report_type: str):
+def report(report_type: str, market: str = "US"):
     valid = {"today", "weekly", "high", "pains", "benchmarks"}
     if report_type not in valid:
         raise HTTPException(status_code=400, detail="Unknown report type")
+    market = normalize_market(market)
     with db() as conn:
         if report_type == "pains":
             rows = conn.execute("""SELECT pain_label,count(*),coalesce(sum(likes),0),max(comment_text)
-              FROM comments GROUP BY pain_label ORDER BY count(*) DESC""").fetchall()
+              FROM comments c JOIN opportunities o ON o.id=c.opportunity_id
+              WHERE o.market=%s GROUP BY pain_label ORDER BY count(*) DESC""", (market,)).fetchall()
             lines = ["# 评论痛点报告", "", "> 机器关键词归类，需人工复核。"]
             lines += [f"- {x[0]}：{x[1]} 条，点赞 {x[2]}；示例：{x[3]}" for x in rows]
         elif report_type == "benchmarks":
             rows = conn.execute("""SELECT category,platform,count(*),round(avg(score)),max(score),round(avg(momentum)),round(avg(demand))
-              FROM opportunities GROUP BY category,platform ORDER BY avg(score) DESC""").fetchall()
+              FROM opportunities WHERE market=%s GROUP BY category,platform ORDER BY avg(score) DESC""", (market,)).fetchall()
             lines = ["# 类目与平台基准报告", "", "| 类目 | 平台 | 信号数 | 平均分 | 最高分 | 平均动能 | 平均需求 |", "|---|---|---:|---:|---:|---:|---:|"]
             lines += [f"| {x[0]} | {x[1]} | {x[2]} | {x[3]} | {x[4]} | {x[5]} | {x[6]} |" for x in rows]
         else:
             condition = "score >= 70" if report_type == "high" else ("created_at >= CURRENT_DATE" if report_type == "today" else "created_at >= CURRENT_DATE - INTERVAL '7 days'")
+            condition = f"market = '{market}' AND {condition}"
             rows = conn.execute(f"""SELECT product,category,platform,score,momentum,demand,comment_count,gap,risk,source_url
               FROM opportunities WHERE {condition} ORDER BY score DESC LIMIT 100""").fetchall()
             title = {"today": "今日机会报告", "weekly": "周趋势机会报告", "high": "高优先级机会报告"}[report_type]
@@ -429,10 +485,11 @@ def report(report_type: str):
 
 
 @app.get("/api/export.csv")
-def export_csv():
+def export_csv(market: str = "US"):
+    market = normalize_market(market)
     with db() as conn:
         rows = conn.execute("""SELECT product,category,platform,score,momentum,demand,comment_count,pain_points,gap,risk,source_url,created_at
-          FROM opportunities ORDER BY score DESC,created_at DESC""").fetchall()
+          FROM opportunities WHERE market=%s ORDER BY score DESC,created_at DESC""", (market,)).fetchall()
     out = io.StringIO()
     writer = csv.writer(out)
     writer.writerow(["product", "category", "platform", "score", "momentum", "demand", "comments", "pain_points", "gap", "risk", "source_url", "created_at"])
