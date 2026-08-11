@@ -199,8 +199,12 @@ def dataset_payload(config, key, value, include_limit=False):
 def collect_platform(config, keyword):
     if not config["posts_dataset_id"]:
         raise SourceNotConfigured(f"{config['name']} posts Dataset ID is not configured")
-    values = config["posts_inputs"] or [keyword]
     discover_by = config.get("discover_by", "")
+    if discover_by == "url" and not config["posts_inputs"]:
+        raise SourceNotConfigured(
+            f"{config['name']} discover_by=url requires BRIGHTDATA_{config['slug'].upper()}_POSTS_INPUTS_{config['market']}"
+        )
+    values = config["posts_inputs"] or [keyword]
     return request_json(dataset_url(config["posts_dataset_id"], discovery=config["posts_mode"] != "scrape", discover_by=discover_by),
                         dataset_payload(config, config["input_key"], values, include_limit=discover_by != "url"))
 
