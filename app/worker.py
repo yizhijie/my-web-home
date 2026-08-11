@@ -458,8 +458,13 @@ def run():
         run_market(market)
 
 
-wait_for_db()
-ensure_worker_schema()
-while True:
-    run()
-    time.sleep(INTERVAL)
+def main():
+    wait_for_db()
+    ensure_worker_schema()
+    while True:
+        run()
+        time.sleep(INTERVAL)
+
+
+if __name__ == "__main__":
+    main()
