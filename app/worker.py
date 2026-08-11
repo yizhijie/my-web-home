@@ -42,6 +42,7 @@ SOURCE_SPECS = {
     "amazon": {"name": "Amazon", "kind": "reviews", "input_default": "url", "posts_mode_default": "scrape"},
     "google_maps": {"name": "Google Maps", "kind": "reviews", "input_default": "url", "posts_mode_default": "scrape"},
 }
+TIKTOK_URL_DATASET_ID = "gd_lu702nij2f790tmv9h"
 SOURCE_ORDER = ["tiktok", "instagram", "youtube", "facebook", "x", "reddit", "amazon", "google_maps"]
 ENABLED_PLATFORMS = {x.strip().lower() for x in os.environ.get("SOCIAL_PLATFORMS_ENABLED", "tiktok").split(",") if x.strip()}
 
@@ -72,7 +73,17 @@ def source_config(slug, market="US"):
     market_inputs = os.environ.get(f"{prefix}_POSTS_INPUTS_{market}")
     posts_inputs = [x.strip() for x in (market_inputs if market_inputs is not None else os.environ.get(f"{prefix}_POSTS_INPUTS", "")).split(",") if x.strip()]
     country_field = (os.environ.get(f"{prefix}_COUNTRY_FIELD") or "").strip()
+    posts_mode = (os.environ.get(f"{prefix}_POSTS_MODE") or spec.get("posts_mode_default", "discovery")).strip().lower()
+    discover_by = (os.environ.get(f"{prefix}_DISCOVER_BY") or ("url" if slug == "tiktok" and posts_mode == "scrape" else "")).strip().lower()
+    payload_mode = (os.environ.get(f"{prefix}_PAYLOAD_MODE") or ("wrapped" if slug == "tiktok" else "array")).strip().lower()
     market_error = ""
+    if slug == "tiktok" and discover_by == "url":
+        # Bright Data's official TikTok URL discovery Dataset has a fixed ID
+        # and requires the wrapped {"input": [{"url": ...}]} request shape.
+        posts_id = os.environ.get(f"{prefix}_URL_DATASET_ID") or posts_id or TIKTOK_URL_DATASET_ID
+        if posts_id != TIKTOK_URL_DATASET_ID:
+            market_error = f"TikTok URL Dataset ID 必须为 {TIKTOK_URL_DATASET_ID}；当前为 {posts_id}"
+        payload_mode = "wrapped"
     has_market_inputs = market_inputs is not None and bool(posts_inputs)
     if market != "US" and spec["kind"] == "social" and not country_field and not has_market_inputs:
         market_error = f"当前 {spec['name']} Dataset 未配置市场字段；请配置该市场的 URL Dataset 输入后再采集"
@@ -86,9 +97,9 @@ def source_config(slug, market="US"):
         "comments_dataset_id": comments_id.strip(),
         "input_key": (os.environ.get(f"{prefix}_POSTS_INPUT_KEY") or spec["input_default"]).strip(),
         "comments_input_key": (os.environ.get(f"{prefix}_COMMENTS_INPUT_KEY") or "url").strip(),
-        "payload_mode": (os.environ.get(f"{prefix}_PAYLOAD_MODE") or ("wrapped" if slug == "tiktok" else "array")).strip().lower(),
-        "posts_mode": (os.environ.get(f"{prefix}_POSTS_MODE") or spec.get("posts_mode_default", "discovery")).strip().lower(),
-        "discover_by": (os.environ.get(f"{prefix}_DISCOVER_BY") or ("url" if slug == "tiktok" and (os.environ.get(f"{prefix}_POSTS_MODE") or spec.get("posts_mode_default", "discovery")).strip().lower() == "scrape" else "")).strip().lower(),
+        "payload_mode": payload_mode,
+        "posts_mode": posts_mode,
+        "discover_by": discover_by,
         "posts_inputs": posts_inputs,
         "country_field": country_field,
         "market_error": market_error,
@@ -193,13 +204,21 @@ def dataset_payload(config, key, value, include_limit=False):
         if config.get("country_field") and config.get("discover_by") != "url":
             item[config["country_field"]] = config["market"].lower()
         items.append(item)
-    return items if config["payload_mode"] == "array" else {"input": items}
+    # TikTok discover-by-URL is strict: it rejects a bare array and any
+    # country field. Keep the request shape correct even if an old .env still
+    # contains BRIGHTDATA_TIKTOK_PAYLOAD_MODE=array.
+    payload_mode = config["payload_mode"]
+    if config.get("slug") == "tiktok" and config.get("discover_by") == "url":
+        payload_mode = "wrapped"
+    return items if payload_mode == "array" else {"input": items}
 
 
 def collect_platform(config, keyword):
     if not config["posts_dataset_id"]:
         raise SourceNotConfigured(f"{config['name']} posts Dataset ID is not configured")
     discover_by = config.get("discover_by", "")
+    if config.get("market_error"):
+        raise SourceNotConfigured(config["market_error"])
     if discover_by == "url" and not config["posts_inputs"]:
         raise SourceNotConfigured(
             f"{config['name']} discover_by=url requires BRIGHTDATA_{config['slug'].upper()}_POSTS_INPUTS_{config['market']}"
