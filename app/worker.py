@@ -80,7 +80,11 @@ def source_config(slug, market="US"):
     if slug == "tiktok" and discover_by == "url":
         # Bright Data's official TikTok URL discovery Dataset has a fixed ID
         # and requires the wrapped {"input": [{"url": ...}]} request shape.
-        posts_id = os.environ.get(f"{prefix}_URL_DATASET_ID") or posts_id or TIKTOK_URL_DATASET_ID
+        # Do not reuse BRIGHTDATA_TIKTOK_POSTS_DATASET_ID here: that variable
+        # is commonly set to the keyword Dataset and its schema rejects url.
+        # Only the explicit URL override is allowed, and it must still match
+        # Bright Data's documented URL Dataset ID.
+        posts_id = os.environ.get(f"{prefix}_URL_DATASET_ID") or TIKTOK_URL_DATASET_ID
         if posts_id != TIKTOK_URL_DATASET_ID:
             market_error = f"TikTok URL Dataset ID 必须为 {TIKTOK_URL_DATASET_ID}；当前为 {posts_id}"
         payload_mode = "wrapped"
