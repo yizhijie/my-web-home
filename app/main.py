@@ -57,6 +57,7 @@ def init_db():
         conn.execute("ALTER TABLE opportunities ADD COLUMN IF NOT EXISTS pain_points TEXT NOT NULL DEFAULT ''")
         conn.execute("ALTER TABLE opportunities ADD COLUMN IF NOT EXISTS comments_checked_at TIMESTAMPTZ")
         conn.execute("ALTER TABLE opportunities ADD COLUMN IF NOT EXISTS market TEXT NOT NULL DEFAULT 'US'")
+        conn.execute("ALTER TABLE opportunities ADD COLUMN IF NOT EXISTS published_at TIMESTAMPTZ")
         conn.execute("""CREATE TABLE IF NOT EXISTS validation_checks (
           opportunity_id INTEGER PRIMARY KEY REFERENCES opportunities(id) ON DELETE CASCADE,
           target_price NUMERIC(12,2) NOT NULL DEFAULT 0,
@@ -83,8 +84,10 @@ def init_db():
           replies INTEGER NOT NULL DEFAULT 0,
           pain_label TEXT NOT NULL DEFAULT 'other',
           comment_url TEXT UNIQUE,
-          created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+          created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+          published_at TIMESTAMPTZ
         )""")
+        conn.execute("ALTER TABLE comments ADD COLUMN IF NOT EXISTS published_at TIMESTAMPTZ")
         conn.execute("""CREATE TABLE IF NOT EXISTS trend_snapshots (
           id SERIAL PRIMARY KEY,
           snapshot_date DATE NOT NULL DEFAULT CURRENT_DATE,
@@ -226,13 +229,13 @@ def list_opportunities(
              "demand": "demand DESC, score DESC", "comments": "comment_count DESC, score DESC",
              "recent": "created_at DESC"}.get(sort, "score DESC, created_at DESC")
     query = f"""SELECT id,product,category,platform,score,momentum,cross_platform,
-      demand,gap,risk,source_url,comment_count,pain_points,created_at,market
+      demand,gap,risk,source_url,comment_count,pain_points,created_at,published_at,market
       FROM opportunities WHERE {' AND '.join(clauses)}
       ORDER BY {order} LIMIT 200"""
     with db() as conn:
         rows = conn.execute(query, params).fetchall()
     keys = ["id", "product", "category", "platform", "score", "momentum", "cross_platform",
-            "demand", "gap", "risk", "source_url", "comment_count", "pain_points", "created_at", "market"]
+            "demand", "gap", "risk", "source_url", "comment_count", "pain_points", "created_at", "published_at", "market"]
     result = []
     for row in rows:
         item = dict(zip(keys, row))
@@ -297,9 +300,11 @@ def pains(limit: int = Query(12, ge=1, le=50), market: str = "US"):
     market = normalize_market(market)
     with db() as conn:
         rows = conn.execute("""SELECT pain_label, count(*), coalesce(sum(likes),0),
-          max(comment_text) FROM comments c JOIN opportunities o ON o.id=c.opportunity_id
+          max(comment_text), min(c.published_at), max(c.published_at)
+          FROM comments c JOIN opportunities o ON o.id=c.opportunity_id
           WHERE o.market=%s GROUP BY pain_label ORDER BY count(*) DESC LIMIT %s""", (market, limit)).fetchall()
-    return [{"label": x[0], "count": x[1], "likes": x[2], "example": x[3]} for x in rows]
+    return [{"label": x[0], "count": x[1], "likes": x[2], "example": x[3],
+             "first_comment_at": x[4], "last_comment_at": x[5]} for x in rows]
 
 
 @app.get("/api/pains/{pain_label}")
@@ -308,14 +313,14 @@ def pain_detail(pain_label: str, market: str = "US"):
     market = normalize_market(market)
     with db() as conn:
         rows = conn.execute("""SELECT c.comment_text,c.likes,c.replies,c.pain_label,c.comment_url,
-          c.created_at,o.id,o.product,o.category,o.platform,o.score
+          c.published_at,c.created_at,o.id,o.product,o.category,o.platform,o.score
           FROM comments c JOIN opportunities o ON o.id=c.opportunity_id
           WHERE c.pain_label=%s AND o.market=%s ORDER BY c.likes DESC,c.created_at DESC LIMIT 100""", (pain_label, market)).fetchall()
     comments = []
     products = {}
     for row in rows:
-        comment = dict(zip(["text", "likes", "replies", "pain_label", "url", "created_at"], row[:6]))
-        product = dict(zip(["id", "product", "category", "platform", "score"], row[6:]))
+        comment = dict(zip(["text", "likes", "replies", "pain_label", "url", "published_at", "created_at"], row[:7]))
+        product = dict(zip(["id", "product", "category", "platform", "score"], row[7:]))
         comment["opportunity"] = product
         comments.append(comment)
         products[product["id"]] = product
@@ -338,15 +343,15 @@ def benchmarks(market: str = "US"):
 def opportunity_detail(opportunity_id: int):
     with db() as conn:
         row = conn.execute("""SELECT id,product,category,platform,score,momentum,cross_platform,
-          demand,gap,risk,source_url,comment_count,pain_points,created_at,market
+          demand,gap,risk,source_url,comment_count,pain_points,created_at,published_at,market
           FROM opportunities WHERE id=%s""", (opportunity_id,)).fetchone()
         if not row:
             raise HTTPException(status_code=404, detail="Opportunity not found")
-        comments = conn.execute("""SELECT comment_text,likes,replies,pain_label,comment_url,created_at
+        comments = conn.execute("""SELECT comment_text,likes,replies,pain_label,comment_url,published_at,created_at
           FROM comments WHERE opportunity_id=%s ORDER BY likes DESC, created_at DESC LIMIT 30""", (opportunity_id,)).fetchall()
     keys = ["id", "product", "category", "platform", "score", "momentum", "cross_platform", "demand",
-            "gap", "risk", "source_url", "comment_count", "pain_points", "created_at", "market"]
-    comment_keys = ["text", "likes", "replies", "pain_label", "url", "created_at"]
+            "gap", "risk", "source_url", "comment_count", "pain_points", "created_at", "published_at", "market"]
+    comment_keys = ["text", "likes", "replies", "pain_label", "url", "published_at", "created_at"]
     result = dict(zip(keys, row))
     result["comments"] = [dict(zip(comment_keys, x)) for x in comments]
     return result

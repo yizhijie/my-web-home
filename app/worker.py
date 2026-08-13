@@ -130,6 +130,7 @@ def ensure_worker_schema():
                 conn.execute("ALTER TABLE collector_runs ADD COLUMN IF NOT EXISTS source_kind TEXT NOT NULL DEFAULT 'social'")
                 conn.execute("ALTER TABLE collector_runs ADD COLUMN IF NOT EXISTS market TEXT NOT NULL DEFAULT 'US'")
                 conn.execute("ALTER TABLE opportunities ADD COLUMN IF NOT EXISTS market TEXT NOT NULL DEFAULT 'US'")
+                conn.execute("ALTER TABLE opportunities ADD COLUMN IF NOT EXISTS published_at TIMESTAMPTZ")
                 conn.execute("ALTER TABLE trend_snapshots ADD COLUMN IF NOT EXISTS market TEXT NOT NULL DEFAULT 'US'")
                 conn.execute("ALTER TABLE trend_snapshots DROP CONSTRAINT IF EXISTS trend_snapshots_snapshot_date_category_platform_key")
                 conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS trend_snapshots_market_key ON trend_snapshots(snapshot_date, market, category, platform)")
@@ -152,6 +153,19 @@ def ensure_worker_schema():
                 conn.execute("ALTER TABLE source_status ADD COLUMN IF NOT EXISTS market TEXT NOT NULL DEFAULT 'US'")
                 conn.execute("ALTER TABLE source_status DROP CONSTRAINT IF EXISTS source_status_pkey")
                 conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS source_status_market_key ON source_status(source_key, market)")
+                conn.execute("""CREATE TABLE IF NOT EXISTS comments (
+                  id SERIAL PRIMARY KEY,
+                  opportunity_id INTEGER NOT NULL,
+                  platform TEXT NOT NULL,
+                  comment_text TEXT NOT NULL,
+                  likes INTEGER NOT NULL DEFAULT 0,
+                  replies INTEGER NOT NULL DEFAULT 0,
+                  pain_label TEXT NOT NULL DEFAULT 'other',
+                  comment_url TEXT UNIQUE,
+                  created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+                  published_at TIMESTAMPTZ
+                )""")
+                conn.execute("ALTER TABLE comments ADD COLUMN IF NOT EXISTS published_at TIMESTAMPTZ")
             return
         except Exception:
             time.sleep(2)
@@ -362,6 +376,30 @@ def first_value(item, keys):
     return ""
 
 
+def source_datetime(value):
+    """Parse a provider timestamp without falling back to collection time."""
+    if isinstance(value, list):
+        value = value[0] if value else None
+    if value in (None, "", []):
+        return None
+    if isinstance(value, (int, float)) or (isinstance(value, str) and re.fullmatch(r"\d+(?:\.\d+)?", value.strip())):
+        try:
+            number = float(value)
+            if number > 10_000_000_000:
+                number /= 1000
+            return datetime.fromtimestamp(number, timezone.utc)
+        except (OverflowError, ValueError, OSError):
+            return None
+    if isinstance(value, str):
+        raw = value.strip()
+        try:
+            parsed = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+            return parsed if parsed.tzinfo else parsed.replace(tzinfo=timezone.utc)
+        except ValueError:
+            return None
+    return None
+
+
 def classify_pain(text):
     for label, pattern in PAIN_RULES:
         if re.search(pattern, text or "", re.IGNORECASE):
@@ -392,17 +430,18 @@ def save_posts(items, category, config, keyword):
             comments = safe_int(first_value(item, ["comment_count", "comments_count", "comments", "num_comments"]))
             shares = safe_int(first_value(item, ["share_count", "shares", "reposts", "retweets"]))
             likes = safe_int(first_value(item, ["like_count", "likes", "likes_count", "upvotes", "reactions_count"]))
+            published_at = source_datetime(first_value(item, ["published_at", "publish_time", "create_time", "created_time", "createTime", "timestamp", "posted_at", "date_posted", "date"]))
             momentum = min(100, round((plays / 1000000) * 45 + (shares / 1000) * 20 + (likes / 100000) * 20 + (comments / 500) * 15))
             demand = min(100, round((comments / 300) * 70 + (likes / 100000) * 20 + 10))
             score = min(100, round(momentum * .45 + demand * .30 + 25))
             product = extract_text(item, f"{config['name']} · {keyword}")
             row = conn.execute("""INSERT INTO opportunities
-              (product,category,platform,score,momentum,cross_platform,demand,gap,risk,source_url,comment_count,market)
+              (product,category,platform,score,momentum,cross_platform,demand,gap,risk,source_url,comment_count,market,published_at)
               SELECT %s,%s,%s,%s,%s,%s,%s,'Review comments and competitor gaps before sourcing',
-                'Validate IP, safety and product claims',%s,%s,%s
+                'Validate IP, safety and product claims',%s,%s,%s,%s
               WHERE NOT EXISTS (SELECT 1 FROM opportunities WHERE source_url=%s AND market=%s)
               RETURNING id, source_url""",
-              (product, category, config["name"], score, momentum, 25, demand, url, comments, config["market"], url, config["market"])).fetchone()
+              (product, category, config["name"], score, momentum, 25, demand, url, comments, config["market"], published_at, url, config["market"])).fetchone()
             if row:
                 urls.append((row[0], row[1]))
     return urls
@@ -423,10 +462,11 @@ def collect_comments(opportunity_id, post_url, config):
                 if not text:
                     continue
                 unique_url = comment_url or f"{post_url}#comment-{abs(hash(text))}"
-                conn.execute("""INSERT INTO comments(opportunity_id,platform,comment_text,likes,replies,pain_label,comment_url)
-                  VALUES(%s,%s,%s,%s,%s,%s,%s) ON CONFLICT (comment_url) DO NOTHING""",
+                published_at = source_datetime(first_value(item, ["published_at", "publish_time", "create_time", "created_time", "createTime", "timestamp", "posted_at", "comment_date", "date_posted", "date"]))
+                conn.execute("""INSERT INTO comments(opportunity_id,platform,comment_text,likes,replies,pain_label,comment_url,published_at)
+                  VALUES(%s,%s,%s,%s,%s,%s,%s,%s) ON CONFLICT (comment_url) DO UPDATE SET published_at=COALESCE(comments.published_at, EXCLUDED.published_at)""",
                   (opportunity_id, config["name"], text[:1000], safe_int(first_value(item, ["num_likes", "likes", "upvotes"])),
-                   safe_int(first_value(item, ["num_replies", "replies", "comments_count"])), classify_pain(text), unique_url))
+                   safe_int(first_value(item, ["num_replies", "replies", "comments_count"])), classify_pain(text), unique_url, published_at))
             labels = conn.execute("""SELECT pain_label,count(*) FROM comments WHERE opportunity_id=%s
               GROUP BY pain_label ORDER BY count(*) DESC LIMIT 3""", (opportunity_id,)).fetchall()
             pain = "; ".join(f"{label} ({count})" for label, count in labels if label != "other")
