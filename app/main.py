@@ -491,11 +491,36 @@ def list_watchlist(market: str = "US"):
     market = normalize_market(market)
     with db() as conn:
         rows = conn.execute("""SELECT w.opportunity_id,w.note,w.created_at,
-          o.product,o.category,o.platform,o.score,o.momentum,o.demand,o.comment_count,o.source_url
+          o.product,o.category,o.platform,o.score,o.momentum,o.demand,o.comment_count,o.source_url,
+          prev.score,prev.momentum,prev.demand,prev.comment_count
           FROM watchlists w JOIN opportunities o ON o.id=w.opportunity_id
+          LEFT JOIN LATERAL (
+            SELECT s.score,s.momentum,s.demand,s.comment_count
+            FROM opportunity_snapshots s
+            WHERE s.opportunity_id=o.id AND s.market=o.market
+            ORDER BY s.snapshot_date DESC,s.snapshot_at DESC
+            OFFSET 1 LIMIT 1
+          ) prev ON TRUE
           WHERE w.user_key='local' AND w.market=%s ORDER BY w.created_at DESC""", (market,)).fetchall()
-    keys = ["opportunity_id", "note", "created_at", "product", "category", "platform", "score", "momentum", "demand", "comment_count", "source_url"]
-    return [dict(zip(keys, row)) for row in rows]
+    keys = ["opportunity_id", "note", "created_at", "product", "category", "platform", "score", "momentum", "demand", "comment_count", "source_url",
+            "previous_score", "previous_momentum", "previous_demand", "previous_comment_count"]
+    result = []
+    for row in rows:
+        item = dict(zip(keys, row))
+        if item["previous_score"] is None:
+            item.update({"has_history": False, "delta_score": None, "delta_momentum": None, "delta_demand": None, "delta_comment_count": None, "trend_state": "pending"})
+        else:
+            item.update({
+                "has_history": True,
+                "delta_score": item["score"] - item["previous_score"],
+                "delta_momentum": item["momentum"] - item["previous_momentum"],
+                "delta_demand": item["demand"] - item["previous_demand"],
+                "delta_comment_count": item["comment_count"] - item["previous_comment_count"],
+            })
+            movement = item["delta_score"] * 0.6 + item["delta_momentum"] * 0.4
+            item["trend_state"] = "rising" if movement >= 3 else "falling" if movement <= -3 else "stable"
+        result.append(item)
+    return result
 
 
 @app.post("/api/watchlist/{opportunity_id}")
