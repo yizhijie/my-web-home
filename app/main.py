@@ -131,6 +131,18 @@ def init_db():
         conn.execute("ALTER TABLE trend_snapshots ADD COLUMN IF NOT EXISTS market TEXT NOT NULL DEFAULT 'US'")
         conn.execute("ALTER TABLE trend_snapshots DROP CONSTRAINT IF EXISTS trend_snapshots_snapshot_date_category_platform_key")
         conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS trend_snapshots_market_key ON trend_snapshots(snapshot_date, market, category, platform)")
+        conn.execute("""CREATE TABLE IF NOT EXISTS opportunity_snapshots (
+          id SERIAL PRIMARY KEY,
+          snapshot_date DATE NOT NULL DEFAULT CURRENT_DATE,
+          snapshot_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+          market TEXT NOT NULL DEFAULT 'US',
+          opportunity_id INTEGER NOT NULL REFERENCES opportunities(id) ON DELETE CASCADE,
+          score INTEGER NOT NULL DEFAULT 0,
+          momentum INTEGER NOT NULL DEFAULT 0,
+          demand INTEGER NOT NULL DEFAULT 0,
+          comment_count INTEGER NOT NULL DEFAULT 0,
+          UNIQUE(snapshot_date, market, opportunity_id)
+        )""")
         conn.execute("""CREATE TABLE IF NOT EXISTS collector_runs (
           id SERIAL PRIMARY KEY,
           keyword TEXT NOT NULL,
@@ -579,6 +591,29 @@ def opportunity_benchmark(opportunity_id: int):
     return {"opportunity": item, "same_category_platform": benchmark, "same_category": category_base,
             "score_delta": (item["score"] - (benchmark["avg_score"] or 0)) if benchmark["opportunity_count"] else None,
             "note": "对标值来自已采集信号，不代表销量、市场份额或利润。"}
+
+
+@app.get("/api/opportunities/{opportunity_id}/history")
+def opportunity_history(opportunity_id: int, days: int = Query(90, ge=7, le=365)):
+    with db() as conn:
+        exists = conn.execute("SELECT 1 FROM opportunities WHERE id=%s", (opportunity_id,)).fetchone()
+        if not exists:
+            raise HTTPException(status_code=404, detail="Opportunity not found")
+        rows = conn.execute("""SELECT snapshot_date,snapshot_at,score,momentum,demand,comment_count
+          FROM opportunity_snapshots WHERE opportunity_id=%s AND snapshot_date >= CURRENT_DATE - (%s * INTERVAL '1 day')
+          ORDER BY snapshot_date ASC""", (opportunity_id, days)).fetchall()
+    keys = ["date", "captured_at", "score", "momentum", "demand", "comment_count"]
+    points = [dict(zip(keys, row)) for row in rows]
+    first = points[0] if points else None
+    last = points[-1] if points else None
+    delta = None if not first or not last else {
+        "score": last["score"] - first["score"],
+        "momentum": last["momentum"] - first["momentum"],
+        "demand": last["demand"] - first["demand"],
+        "comment_count": last["comment_count"] - first["comment_count"],
+    }
+    return {"opportunity_id": opportunity_id, "days": days, "points": points, "delta": delta,
+            "has_history": len(points) >= 2, "note": "历史变化来自每日采集快照；单个快照不代表销量或利润。"}
 
 
 def _validation_result(opportunity_id: int, values: dict):

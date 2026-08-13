@@ -139,6 +139,18 @@ def ensure_worker_schema():
                 conn.execute("ALTER TABLE trend_snapshots ADD COLUMN IF NOT EXISTS market TEXT NOT NULL DEFAULT 'US'")
                 conn.execute("ALTER TABLE trend_snapshots DROP CONSTRAINT IF EXISTS trend_snapshots_snapshot_date_category_platform_key")
                 conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS trend_snapshots_market_key ON trend_snapshots(snapshot_date, market, category, platform)")
+                conn.execute("""CREATE TABLE IF NOT EXISTS opportunity_snapshots (
+                  id SERIAL PRIMARY KEY,
+                  snapshot_date DATE NOT NULL DEFAULT CURRENT_DATE,
+                  snapshot_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+                  market TEXT NOT NULL DEFAULT 'US',
+                  opportunity_id INTEGER NOT NULL,
+                  score INTEGER NOT NULL DEFAULT 0,
+                  momentum INTEGER NOT NULL DEFAULT 0,
+                  demand INTEGER NOT NULL DEFAULT 0,
+                  comment_count INTEGER NOT NULL DEFAULT 0,
+                  UNIQUE(snapshot_date, market, opportunity_id)
+                )""")
                 conn.execute("ALTER TABLE google_trends ADD COLUMN IF NOT EXISTS region TEXT NOT NULL DEFAULT 'US'")
                 conn.execute("ALTER TABLE google_trends DROP CONSTRAINT IF EXISTS google_trends_keyword_trend_date_related_query_key")
                 conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS google_trends_region_key ON google_trends(keyword, region, trend_date, related_query)")
@@ -547,6 +559,15 @@ def snapshot_pains(market):
           ON CONFLICT(snapshot_date,market,platform,pain_label,sentiment) DO UPDATE SET comment_count=EXCLUDED.comment_count,total_comments=EXCLUDED.total_comments""", (market,))
 
 
+def snapshot_opportunities(market):
+    with psycopg.connect(DB) as conn:
+        conn.execute("""INSERT INTO opportunity_snapshots(snapshot_date,snapshot_at,market,opportunity_id,score,momentum,demand,comment_count)
+          SELECT CURRENT_DATE,now(),market,id,score,momentum,demand,comment_count
+          FROM opportunities WHERE market=%s
+          ON CONFLICT(snapshot_date,market,opportunity_id) DO UPDATE SET snapshot_at=EXCLUDED.snapshot_at,
+            score=EXCLUDED.score,momentum=EXCLUDED.momentum,demand=EXCLUDED.demand,comment_count=EXCLUDED.comment_count""", (market,))
+
+
 def run_platform(config, comment_budget):
     if not config["enabled"]:
         mark_source(config, "disabled")
@@ -621,6 +642,7 @@ def run_market(market):
     for slug in SOURCE_ORDER:
         comment_budget = run_platform(source_config(slug, market), comment_budget)
     snapshot_pains(market)
+    snapshot_opportunities(market)
 
 
 def run():
