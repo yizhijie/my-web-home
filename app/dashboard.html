@@ -119,7 +119,7 @@ openPain=async function(label){
   document.querySelectorAll('#pains .pain').forEach(x=>x.classList.toggle('selected',x.dataset.pain===label));
   detail.dataset.label=label;detail.innerHTML='<div class="empty">正在读取该痛点的评论样本…</div>';
   try{
-    const d=await get('/api/pains/'+encodeURIComponent(label)),comments=d.comments||[],products=d.opportunities||[];
+    const d=await get('/api/pain-detail?label='+encodeURIComponent(label)),comments=d.comments||[],products=d.opportunities||[];
     detail.innerHTML=`<div class="pain-detail-head"><h3>${esc(label)} · 证据明细</h3><button class="light" onclick="closePainDetail()">关闭</button></div><div class="pain-detail-meta">${d.count} 条评论样本 · 机器归类，建议人工复核</div><div class="pain-comments">${comments.length?comments.slice(0,12).map(c=>`<div class="pain-comment"><p>${esc(c.text)}</p><div class="subline"><span>${c.likes} 赞 · ${c.replies} 回复 · ${esc(c.opportunity.product)}</span>${sourceTime(c.published_at,'评论时间')}<button onclick="openDetail(${c.opportunity.id})">查看机会</button></div></div>`).join(''):'<div class="empty">暂无关联评论样本</div>'}</div>${products.length?`<div class="pain-products"><b>关联机会：</b>${products.slice(0,8).map(p=>`<span class="pain-product">${esc(p.product)} · ${p.score} 分</span>`).join('')}</div>`:''}<div style="margin-top:10px"><button class="light" onclick="filterByPain(document.getElementById('painDetail').dataset.label)">在机会榜中筛选该痛点</button></div>`;
   }catch(e){detail.innerHTML='<div class="empty">痛点明细读取失败，请稍后重试</div>'}
 };

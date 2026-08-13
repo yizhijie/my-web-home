@@ -328,6 +328,12 @@ def pain_detail(pain_label: str, market: str = "US"):
             "opportunities": list(products.values())}
 
 
+@app.get("/api/pain-detail")
+def pain_detail_query(label: str = Query(..., min_length=1, max_length=100), market: str = "US"):
+    """Slash-safe pain detail endpoint for labels such as 'comfort / noise'."""
+    return pain_detail(label, market)
+
+
 @app.get("/api/benchmarks")
 def benchmarks(market: str = "US"):
     market = normalize_market(market)
