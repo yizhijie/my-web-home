@@ -13,6 +13,8 @@ DB = os.environ["DATABASE_URL"]
 TOKEN = os.environ.get("BRIGHTDATA_API_TOKEN", "")
 INTERVAL = int(os.environ.get("COLLECTION_INTERVAL_SECONDS", "86400"))
 LIMIT = int(os.environ.get("POSTS_PER_KEYWORD", "3"))
+SNAPSHOT_TIMEOUT = int(os.environ.get("BRIGHTDATA_SNAPSHOT_TIMEOUT_SECONDS", "900"))
+SNAPSHOT_POLL_SECONDS = int(os.environ.get("BRIGHTDATA_SNAPSHOT_POLL_SECONDS", "10"))
 COLLECT_COMMENTS = os.environ.get("COLLECT_COMMENTS", "true").lower() in {"1", "true", "yes"}
 MAX_COMMENT_POSTS = int(os.environ.get("MAX_COMMENT_POSTS_PER_RUN", "3"))
 GOOGLE_TRENDS_ENABLED = os.environ.get("GOOGLE_TRENDS_ENABLED", "false").lower() in {"1", "true", "yes"}
@@ -169,6 +171,57 @@ def mark_source(config, status, rows=0, error=""):
                        bool(config.get("configured", config["posts_dataset_id"])), status, rows, str(error or "")[:500]))
 
 
+def _decode_json_response(raw):
+    """Normalize Bright Data JSON/NDJSON responses into a list of records."""
+    try:
+        parsed = json.loads(raw)
+        if isinstance(parsed, list):
+            return parsed
+        if isinstance(parsed, dict) and isinstance(parsed.get("data"), list):
+            return parsed["data"]
+        return [parsed]
+    except json.JSONDecodeError:
+        return [json.loads(line) for line in raw.splitlines() if line.strip()]
+
+
+def _brightdata_get_json(url):
+    req = urllib.request.Request(url, headers={"Authorization": f"Bearer {TOKEN}"}, method="GET")
+    try:
+        with urllib.request.urlopen(req, timeout=180) as response:
+            raw = response.read().decode().strip()
+    except urllib.error.HTTPError as exc:
+        body = exc.read().decode("utf-8", errors="replace").strip()
+        raise RuntimeError(f"Bright Data HTTP {exc.code}: {body[:600]}") from exc
+    items = _decode_json_response(raw)
+    return items[0] if len(items) == 1 and isinstance(items[0], dict) else items
+
+
+def _download_snapshot(snapshot_id):
+    url = "https://api.brightdata.com/datasets/v3/snapshot/" + urllib.parse.quote(snapshot_id, safe="") + "?format=json"
+    result = _brightdata_get_json(url)
+    if isinstance(result, dict) and isinstance(result.get("data"), list):
+        return result["data"]
+    return result if isinstance(result, list) else [result]
+
+
+def _wait_for_snapshot(snapshot_id):
+    deadline = time.monotonic() + SNAPSHOT_TIMEOUT
+    last_status = None
+    while time.monotonic() < deadline:
+        progress_url = "https://api.brightdata.com/datasets/v3/progress/" + urllib.parse.quote(snapshot_id, safe="")
+        progress = _brightdata_get_json(progress_url)
+        status = str(progress.get("status", "")).lower() if isinstance(progress, dict) else ""
+        if status != last_status:
+            print(f"Bright Data snapshot {snapshot_id}: {status or 'unknown'}", flush=True)
+            last_status = status
+        if status in {"ready", "done", "completed", "finished"}:
+            return _download_snapshot(snapshot_id)
+        if status in {"failed", "error", "cancelled", "canceled"}:
+            raise RuntimeError(f"Bright Data snapshot {snapshot_id} failed: {progress}")
+        time.sleep(max(1, SNAPSHOT_POLL_SECONDS))
+    raise RuntimeError(f"Bright Data snapshot {snapshot_id} timed out after {SNAPSHOT_TIMEOUT}s")
+
+
 def request_json(url, payload):
     data = json.dumps(payload).encode()
     req = urllib.request.Request(url, data=data, headers={"Authorization": f"Bearer {TOKEN}", "Content-Type": "application/json"}, method="POST")
@@ -178,11 +231,13 @@ def request_json(url, payload):
     except urllib.error.HTTPError as exc:
         body = exc.read().decode("utf-8", errors="replace").strip()
         raise RuntimeError(f"Bright Data HTTP {exc.code}: {body[:600]}") from exc
-    try:
-        parsed = json.loads(raw)
-        items = parsed if isinstance(parsed, list) else parsed.get("data") if isinstance(parsed, dict) and isinstance(parsed.get("data"), list) else [parsed]
-    except json.JSONDecodeError:
-        items = [json.loads(line) for line in raw.splitlines() if line.strip()]
+    items = _decode_json_response(raw)
+    snapshots = [item.get("snapshot_id") for item in items if isinstance(item, dict) and item.get("snapshot_id")]
+    if snapshots:
+        # The synchronous endpoint returns a snapshot when collection exceeds
+        # its response window. Poll it and download the actual rows instead of
+        # treating the snapshot status message as one collected post.
+        return _wait_for_snapshot(snapshots[0])
     for item in items:
         if isinstance(item, dict) and (item.get("error") or item.get("status") == "error"):
             raise RuntimeError(str(item.get("error") or item))
