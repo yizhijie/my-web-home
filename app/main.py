@@ -8,7 +8,7 @@ from datetime import datetime, timezone
 
 import psycopg
 from fastapi import FastAPI, HTTPException, Query
-from fastapi.responses import HTMLResponse
+from fastapi.responses import HTMLResponse, Response
 from pydantic import BaseModel, Field
 
 DATABASE_URL = os.environ["DATABASE_URL"]
@@ -75,6 +75,15 @@ def init_db():
           notes TEXT NOT NULL DEFAULT '',
           updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
         )""")
+        conn.execute("""CREATE TABLE IF NOT EXISTS watchlists (
+          id SERIAL PRIMARY KEY,
+          user_key TEXT NOT NULL DEFAULT 'local',
+          market TEXT NOT NULL DEFAULT 'US',
+          opportunity_id INTEGER NOT NULL REFERENCES opportunities(id) ON DELETE CASCADE,
+          note TEXT NOT NULL DEFAULT '',
+          created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+          UNIQUE(user_key, market, opportunity_id)
+        )""")
         conn.execute("""CREATE TABLE IF NOT EXISTS comments (
           id SERIAL PRIMARY KEY,
           opportunity_id INTEGER NOT NULL REFERENCES opportunities(id) ON DELETE CASCADE,
@@ -88,6 +97,24 @@ def init_db():
           published_at TIMESTAMPTZ
         )""")
         conn.execute("ALTER TABLE comments ADD COLUMN IF NOT EXISTS published_at TIMESTAMPTZ")
+        conn.execute("ALTER TABLE comments ADD COLUMN IF NOT EXISTS sentiment TEXT NOT NULL DEFAULT 'unknown'")
+        conn.execute("ALTER TABLE comments ADD COLUMN IF NOT EXISTS sentiment_score NUMERIC(6,3)")
+        conn.execute("ALTER TABLE comments ADD COLUMN IF NOT EXISTS aspect TEXT NOT NULL DEFAULT 'other'")
+        conn.execute("ALTER TABLE comments ADD COLUMN IF NOT EXISTS classification_confidence NUMERIC(5,4)")
+        conn.execute("ALTER TABLE comments ADD COLUMN IF NOT EXISTS review_status TEXT NOT NULL DEFAULT 'machine_labeled'")
+        conn.execute("ALTER TABLE comments ADD COLUMN IF NOT EXISTS language TEXT NOT NULL DEFAULT 'en'")
+        conn.execute("ALTER TABLE comments ADD COLUMN IF NOT EXISTS source_post_id TEXT NOT NULL DEFAULT ''")
+        conn.execute("""CREATE TABLE IF NOT EXISTS pain_snapshots (
+          id SERIAL PRIMARY KEY,
+          snapshot_date DATE NOT NULL DEFAULT CURRENT_DATE,
+          market TEXT NOT NULL DEFAULT 'US',
+          platform TEXT NOT NULL,
+          pain_label TEXT NOT NULL,
+          sentiment TEXT NOT NULL DEFAULT 'unknown',
+          comment_count INTEGER NOT NULL DEFAULT 0,
+          total_comments INTEGER NOT NULL DEFAULT 0,
+          UNIQUE(snapshot_date, market, platform, pain_label, sentiment)
+        )""")
         conn.execute("""CREATE TABLE IF NOT EXISTS trend_snapshots (
           id SERIAL PRIMARY KEY,
           snapshot_date DATE NOT NULL DEFAULT CURRENT_DATE,
@@ -188,6 +215,10 @@ class ValidationInput(BaseModel):
     notes: str = Field(default="", max_length=2000)
 
 
+class WatchlistInput(BaseModel):
+    note: str = Field(default="", max_length=500)
+
+
 @app.get("/api/opportunities")
 def list_opportunities(
     market: str = "US",
@@ -228,14 +259,15 @@ def list_opportunities(
     order = {"score": "score DESC, created_at DESC", "momentum": "momentum DESC, score DESC",
              "demand": "demand DESC, score DESC", "comments": "comment_count DESC, score DESC",
              "recent": "created_at DESC"}.get(sort, "score DESC, created_at DESC")
-    query = f"""SELECT id,product,category,platform,score,momentum,cross_platform,
-      demand,gap,risk,source_url,comment_count,pain_points,created_at,published_at,market
-      FROM opportunities WHERE {' AND '.join(clauses)}
+    query = f"""SELECT o.id,o.product,o.category,o.platform,o.score,o.momentum,o.cross_platform,
+      o.demand,o.gap,o.risk,o.source_url,o.comment_count,o.pain_points,o.created_at,o.published_at,o.market,
+      EXISTS(SELECT 1 FROM watchlists w WHERE w.opportunity_id=o.id AND w.market=o.market AND w.user_key='local') AS watchlisted
+      FROM opportunities o WHERE {' AND '.join('o.' + x if x.startswith(('market','category','platform','score','product','gap','pain_points','comment_count','risk','momentum')) else x for x in clauses)}
       ORDER BY {order} LIMIT 200"""
     with db() as conn:
         rows = conn.execute(query, params).fetchall()
     keys = ["id", "product", "category", "platform", "score", "momentum", "cross_platform",
-            "demand", "gap", "risk", "source_url", "comment_count", "pain_points", "created_at", "published_at", "market"]
+            "demand", "gap", "risk", "source_url", "comment_count", "pain_points", "created_at", "published_at", "market", "watchlisted"]
     result = []
     for row in rows:
         item = dict(zip(keys, row))
@@ -296,42 +328,139 @@ def trends(days: int = Query(30, ge=7, le=180), market: str = "US"):
 
 
 @app.get("/api/pains")
-def pains(limit: int = Query(12, ge=1, le=50), market: str = "US"):
+def pains(
+    limit: int = Query(12, ge=1, le=50),
+    market: str = "US",
+    platform: str = "",
+    sentiment: str = "",
+    from_date: str = "",
+    to_date: str = "",
+):
     market = normalize_market(market)
+    clauses = ["o.market=%s"]
+    params: list[object] = [market]
+    if platform:
+        clauses.append("o.platform=%s")
+        params.append(platform)
+    if sentiment in {"positive", "neutral", "negative", "unknown"}:
+        clauses.append("c.sentiment=%s")
+        params.append(sentiment)
+    if from_date:
+        clauses.append("COALESCE(c.published_at, c.created_at) >= %s::date")
+        params.append(from_date)
+    if to_date:
+        clauses.append("COALESCE(c.published_at, c.created_at) < (%s::date + INTERVAL '1 day')")
+        params.append(to_date)
     with db() as conn:
-        rows = conn.execute("""SELECT pain_label, count(*), coalesce(sum(likes),0),
-          max(comment_text), min(c.published_at), max(c.published_at)
+        rows = conn.execute(f"""SELECT c.pain_label, count(*), coalesce(sum(c.likes),0),
+          max(c.comment_text), min(c.published_at), max(c.published_at),
+          count(*) FILTER (WHERE c.sentiment='negative'),
+          count(*) FILTER (WHERE c.sentiment='positive'),
+          count(*) FILTER (WHERE c.sentiment='neutral'),
+          count(*) FILTER (WHERE c.sentiment='unknown')
           FROM comments c JOIN opportunities o ON o.id=c.opportunity_id
-          WHERE o.market=%s GROUP BY pain_label ORDER BY count(*) DESC LIMIT %s""", (market, limit)).fetchall()
-    return [{"label": x[0], "count": x[1], "likes": x[2], "example": x[3],
-             "first_comment_at": x[4], "last_comment_at": x[5]} for x in rows]
+          WHERE {' AND '.join(clauses)} GROUP BY c.pain_label ORDER BY count(*) DESC LIMIT %s""", (*params, limit)).fetchall()
+        total = conn.execute(f"SELECT count(*) FROM comments c JOIN opportunities o ON o.id=c.opportunity_id WHERE {' AND '.join(clauses)}", params).fetchone()[0]
+    return [{"label": x[0], "count": x[1], "share": round((x[1] / total * 100), 1) if total else 0,
+             "likes": x[2], "example": x[3], "first_comment_at": x[4], "last_comment_at": x[5],
+             "negative_count": x[6], "positive_count": x[7], "neutral_count": x[8], "unknown_count": x[9],
+             "negative_ratio": round((x[6] / x[1] * 100), 1) if x[1] else 0} for x in rows]
 
 
 @app.get("/api/pains/{pain_label}")
-def pain_detail(pain_label: str, market: str = "US"):
+def pain_detail(
+    pain_label: str,
+    market: str = "US",
+    platform: str = "",
+    sentiment: str = "",
+    from_date: str = "",
+    to_date: str = "",
+    offset: int = Query(0, ge=0, le=100000),
+    limit: int = Query(20, ge=1, le=100),
+):
     """Return review evidence behind one pain label for interactive drill-down."""
     market = normalize_market(market)
     with db() as conn:
-        rows = conn.execute("""SELECT c.comment_text,c.likes,c.replies,c.pain_label,c.comment_url,
-          c.published_at,c.created_at,o.id,o.product,o.category,o.platform,o.score
+        clauses = ["c.pain_label=%s", "o.market=%s"]
+        params: list[object] = [pain_label, market]
+        if platform:
+            clauses.append("o.platform=%s")
+            params.append(platform)
+        if sentiment in {"positive", "neutral", "negative", "unknown"}:
+            clauses.append("c.sentiment=%s")
+            params.append(sentiment)
+        if from_date:
+            clauses.append("COALESCE(c.published_at, c.created_at) >= %s::date")
+            params.append(from_date)
+        if to_date:
+            clauses.append("COALESCE(c.published_at, c.created_at) < (%s::date + INTERVAL '1 day')")
+            params.append(to_date)
+        rows = conn.execute(f"""SELECT c.comment_text,c.likes,c.replies,c.pain_label,c.comment_url,
+          c.published_at,c.created_at,c.sentiment,c.sentiment_score,c.aspect,c.classification_confidence,
+          c.review_status,c.language,c.source_post_id,o.id,o.product,o.category,o.platform,o.score,o.source_url
           FROM comments c JOIN opportunities o ON o.id=c.opportunity_id
-          WHERE c.pain_label=%s AND o.market=%s ORDER BY c.likes DESC,c.created_at DESC LIMIT 100""", (pain_label, market)).fetchall()
+          WHERE {' AND '.join(clauses)} ORDER BY c.likes DESC,COALESCE(c.published_at,c.created_at) DESC OFFSET %s LIMIT %s""", (*params, offset, limit)).fetchall()
+        total = conn.execute(f"SELECT count(*) FROM comments c JOIN opportunities o ON o.id=c.opportunity_id WHERE {' AND '.join(clauses)}", params).fetchone()[0]
     comments = []
     products = {}
     for row in rows:
-        comment = dict(zip(["text", "likes", "replies", "pain_label", "url", "published_at", "created_at"], row[:7]))
-        product = dict(zip(["id", "product", "category", "platform", "score"], row[7:]))
+        comment = dict(zip(["text", "likes", "replies", "pain_label", "url", "published_at", "created_at", "sentiment", "sentiment_score", "aspect", "confidence", "review_status", "language", "source_post_id"], row[:14]))
+        product = dict(zip(["id", "product", "category", "platform", "score", "source_url"], row[14:]))
         comment["opportunity"] = product
         comments.append(comment)
         products[product["id"]] = product
-    return {"label": pain_label, "count": len(comments), "comments": comments,
+    return {"label": pain_label, "count": total, "offset": offset, "limit": limit,
+            "has_more": offset + len(comments) < total, "comments": comments,
             "opportunities": list(products.values())}
 
 
 @app.get("/api/pain-detail")
-def pain_detail_query(label: str = Query(..., min_length=1, max_length=100), market: str = "US"):
+def pain_detail_query(
+    label: str = Query(..., min_length=1, max_length=100),
+    market: str = "US",
+    platform: str = "",
+    sentiment: str = "",
+    from_date: str = "",
+    to_date: str = "",
+    offset: int = Query(0, ge=0, le=100000),
+    limit: int = Query(20, ge=1, le=100),
+):
     """Slash-safe pain detail endpoint for labels such as 'comfort / noise'."""
-    return pain_detail(label, market)
+    return pain_detail(label, market, platform, sentiment, from_date, to_date, offset, limit)
+
+
+@app.get("/api/pains/timeseries")
+def pain_timeseries(
+    label: str = Query(..., min_length=1, max_length=100),
+    days: int = Query(30, ge=7, le=180),
+    market: str = "US",
+    platform: str = "",
+):
+    market = normalize_market(market)
+    clauses = ["c.pain_label=%s", "o.market=%s", "COALESCE(c.published_at,c.created_at) >= CURRENT_DATE - (%s * INTERVAL '1 day')"]
+    params: list[object] = [label, market, days]
+    if platform:
+        clauses.append("o.platform=%s")
+        params.append(platform)
+    with db() as conn:
+        rows = conn.execute(f"""SELECT COALESCE(c.published_at::date,c.created_at::date) AS day,
+          count(*) AS count,
+          count(*) FILTER (WHERE c.sentiment='negative') AS negative_count,
+          count(*) FILTER (WHERE c.sentiment='positive') AS positive_count
+          FROM comments c JOIN opportunities o ON o.id=c.opportunity_id
+          WHERE {' AND '.join(clauses)} GROUP BY day ORDER BY day""", params).fetchall()
+    return [{"date": x[0], "count": x[1], "negative_count": x[2], "positive_count": x[3]} for x in rows]
+
+
+@app.get("/api/pain-timeseries")
+def pain_timeseries_alias(
+    label: str = Query(..., min_length=1, max_length=100),
+    days: int = Query(30, ge=7, le=180),
+    market: str = "US",
+    platform: str = "",
+):
+    """Stable alias kept separate from /api/pains/{pain_label} route matching."""
+    return pain_timeseries(label, days, market, platform)
 
 
 @app.get("/api/benchmarks")
@@ -345,22 +474,111 @@ def benchmarks(market: str = "US"):
     return [dict(zip(keys, row)) for row in rows]
 
 
+@app.get("/api/watchlist")
+def list_watchlist(market: str = "US"):
+    market = normalize_market(market)
+    with db() as conn:
+        rows = conn.execute("""SELECT w.opportunity_id,w.note,w.created_at,
+          o.product,o.category,o.platform,o.score,o.momentum,o.demand,o.comment_count,o.source_url
+          FROM watchlists w JOIN opportunities o ON o.id=w.opportunity_id
+          WHERE w.user_key='local' AND w.market=%s ORDER BY w.created_at DESC""", (market,)).fetchall()
+    keys = ["opportunity_id", "note", "created_at", "product", "category", "platform", "score", "momentum", "demand", "comment_count", "source_url"]
+    return [dict(zip(keys, row)) for row in rows]
+
+
+@app.post("/api/watchlist/{opportunity_id}")
+def add_watchlist(opportunity_id: int, payload: WatchlistInput, market: str = "US"):
+    market = normalize_market(market)
+    with db() as conn:
+        exists = conn.execute("SELECT 1 FROM opportunities WHERE id=%s AND market=%s", (opportunity_id, market)).fetchone()
+        if not exists:
+            raise HTTPException(status_code=404, detail="Opportunity not found")
+        row = conn.execute("""INSERT INTO watchlists(user_key,market,opportunity_id,note)
+          VALUES('local',%s,%s,%s)
+          ON CONFLICT(user_key,market,opportunity_id) DO UPDATE SET note=EXCLUDED.note
+          RETURNING opportunity_id,note,created_at""", (market, opportunity_id, payload.note)).fetchone()
+    return {"saved": True, "market": market, "opportunity_id": row[0], "note": row[1], "created_at": row[2]}
+
+
+@app.delete("/api/watchlist/{opportunity_id}")
+def remove_watchlist(opportunity_id: int, market: str = "US"):
+    market = normalize_market(market)
+    with db() as conn:
+        conn.execute("DELETE FROM watchlists WHERE user_key='local' AND market=%s AND opportunity_id=%s", (market, opportunity_id))
+    return {"saved": False, "market": market, "opportunity_id": opportunity_id}
+
+
+@app.get("/api/export-pains.csv")
+def export_pains_csv(
+    market: str = "US", platform: str = "", sentiment: str = "",
+    from_date: str = "", to_date: str = "",
+):
+    market = normalize_market(market)
+    clauses = ["o.market=%s"]
+    params: list[object] = [market]
+    if platform:
+        clauses.append("o.platform=%s")
+        params.append(platform)
+    if sentiment in {"positive", "neutral", "negative", "unknown"}:
+        clauses.append("c.sentiment=%s")
+        params.append(sentiment)
+    if from_date:
+        clauses.append("COALESCE(c.published_at,c.created_at) >= %s::date")
+        params.append(from_date)
+    if to_date:
+        clauses.append("COALESCE(c.published_at,c.created_at) < (%s::date + INTERVAL '1 day')")
+        params.append(to_date)
+    with db() as conn:
+        rows = conn.execute(f"""SELECT c.pain_label,count(*),coalesce(sum(c.likes),0),coalesce(sum(c.replies),0),
+          count(*) FILTER (WHERE c.sentiment='negative'),count(*) FILTER (WHERE c.sentiment='positive'),
+          count(*) FILTER (WHERE c.sentiment='neutral'),count(*) FILTER (WHERE c.sentiment='unknown'),
+          min(COALESCE(c.published_at,c.created_at)),max(COALESCE(c.published_at,c.created_at)),max(c.comment_text)
+          FROM comments c JOIN opportunities o ON o.id=c.opportunity_id
+          WHERE {' AND '.join(clauses)} GROUP BY c.pain_label ORDER BY count(*) DESC""", params).fetchall()
+    out = io.StringIO()
+    writer = csv.writer(out)
+    writer.writerow(["pain_label", "comment_count", "likes", "replies", "negative_count", "positive_count", "neutral_count", "unknown_count", "first_comment_at", "last_comment_at", "example_comment", "market", "platform_filter"])
+    writer.writerows([(*row, market, platform) for row in rows])
+    return Response(out.getvalue(), media_type="text/csv; charset=utf-8", headers={"Content-Disposition": "attachment; filename=trend-radar-pains.csv"})
+
+
 @app.get("/api/opportunities/{opportunity_id}")
 def opportunity_detail(opportunity_id: int):
     with db() as conn:
         row = conn.execute("""SELECT id,product,category,platform,score,momentum,cross_platform,
-          demand,gap,risk,source_url,comment_count,pain_points,created_at,published_at,market
+          demand,gap,risk,source_url,comment_count,pain_points,created_at,published_at,market,
+          EXISTS(SELECT 1 FROM watchlists w WHERE w.opportunity_id=opportunities.id AND w.market=opportunities.market AND w.user_key='local')
           FROM opportunities WHERE id=%s""", (opportunity_id,)).fetchone()
         if not row:
             raise HTTPException(status_code=404, detail="Opportunity not found")
         comments = conn.execute("""SELECT comment_text,likes,replies,pain_label,comment_url,published_at,created_at
           FROM comments WHERE opportunity_id=%s ORDER BY likes DESC, created_at DESC LIMIT 30""", (opportunity_id,)).fetchall()
     keys = ["id", "product", "category", "platform", "score", "momentum", "cross_platform", "demand",
-            "gap", "risk", "source_url", "comment_count", "pain_points", "created_at", "published_at", "market"]
+            "gap", "risk", "source_url", "comment_count", "pain_points", "created_at", "published_at", "market", "watchlisted"]
     comment_keys = ["text", "likes", "replies", "pain_label", "url", "published_at", "created_at"]
     result = dict(zip(keys, row))
     result["comments"] = [dict(zip(comment_keys, x)) for x in comments]
     return result
+
+
+@app.get("/api/opportunities/{opportunity_id}/benchmark")
+def opportunity_benchmark(opportunity_id: int):
+    with db() as conn:
+        product = conn.execute("""SELECT id,product,category,platform,market,score,momentum,demand,comment_count
+          FROM opportunities WHERE id=%s""", (opportunity_id,)).fetchone()
+        if not product:
+            raise HTTPException(status_code=404, detail="Opportunity not found")
+        base = conn.execute("""SELECT count(*),round(avg(score)),max(score),round(avg(momentum)),round(avg(demand)),coalesce(sum(comment_count),0)
+          FROM opportunities WHERE market=%s AND category=%s AND platform=%s""", (product[4], product[2], product[3])).fetchone()
+        category = conn.execute("""SELECT count(*),round(avg(score)),round(avg(momentum)),round(avg(demand))
+          FROM opportunities WHERE market=%s AND category=%s""", (product[4], product[2])).fetchone()
+    keys = ["id", "product", "category", "platform", "market", "score", "momentum", "demand", "comment_count"]
+    item = dict(zip(keys, product))
+    benchmark = dict(zip(["opportunity_count", "avg_score", "top_score", "avg_momentum", "avg_demand", "comments"], base))
+    category_base = dict(zip(["opportunity_count", "avg_score", "avg_momentum", "avg_demand"], category))
+    return {"opportunity": item, "same_category_platform": benchmark, "same_category": category_base,
+            "score_delta": (item["score"] - (benchmark["avg_score"] or 0)) if benchmark["opportunity_count"] else None,
+            "note": "对标值来自已采集信号，不代表销量、市场份额或利润。"}
 
 
 def _validation_result(opportunity_id: int, values: dict):

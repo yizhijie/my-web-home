@@ -57,6 +57,11 @@ PAIN_RULES = [
     ("value / price", r"\b(price|expensive|cheap|worth|money|cost)\b"),
 ]
 
+SENTIMENT_RULES = {
+    "negative": re.compile(r"\b(broke|broken|tear|ripped|bad|worst|hate|awful|refund|return|disappointed|expensive|loud|smell|dirty|difficult|doesn't|didn't|never)\b", re.I),
+    "positive": re.compile(r"\b(love|loved|great|good|amazing|perfect|easy|quiet|comfortable|worth|recommend|favorite|satisfying)\b", re.I),
+}
+
 
 class SourceNotConfigured(RuntimeError):
     pass
@@ -166,10 +171,36 @@ def ensure_worker_schema():
                   published_at TIMESTAMPTZ
                 )""")
                 conn.execute("ALTER TABLE comments ADD COLUMN IF NOT EXISTS published_at TIMESTAMPTZ")
+                conn.execute("ALTER TABLE comments ADD COLUMN IF NOT EXISTS sentiment TEXT NOT NULL DEFAULT 'unknown'")
+                conn.execute("ALTER TABLE comments ADD COLUMN IF NOT EXISTS sentiment_score NUMERIC(6,3)")
+                conn.execute("ALTER TABLE comments ADD COLUMN IF NOT EXISTS aspect TEXT NOT NULL DEFAULT 'other'")
+                conn.execute("ALTER TABLE comments ADD COLUMN IF NOT EXISTS classification_confidence NUMERIC(5,4)")
+                conn.execute("ALTER TABLE comments ADD COLUMN IF NOT EXISTS review_status TEXT NOT NULL DEFAULT 'machine_labeled'")
+                conn.execute("ALTER TABLE comments ADD COLUMN IF NOT EXISTS language TEXT NOT NULL DEFAULT 'en'")
+                conn.execute("ALTER TABLE comments ADD COLUMN IF NOT EXISTS source_post_id TEXT NOT NULL DEFAULT ''")
+                conn.execute("""CREATE TABLE IF NOT EXISTS pain_snapshots (
+                  id SERIAL PRIMARY KEY, snapshot_date DATE NOT NULL DEFAULT CURRENT_DATE,
+                  market TEXT NOT NULL DEFAULT 'US', platform TEXT NOT NULL,
+                  pain_label TEXT NOT NULL, sentiment TEXT NOT NULL DEFAULT 'unknown',
+                  comment_count INTEGER NOT NULL DEFAULT 0, total_comments INTEGER NOT NULL DEFAULT 0,
+                  UNIQUE(snapshot_date, market, platform, pain_label, sentiment)
+                )""")
             return
         except Exception:
             time.sleep(2)
     raise RuntimeError("database schema unavailable")
+
+
+def backfill_comment_classifications():
+    """Classify already-collected comments once without replacing their source text."""
+    with psycopg.connect(DB) as conn:
+        rows = conn.execute("SELECT id,comment_text,pain_label FROM comments WHERE sentiment='unknown' OR classification_confidence IS NULL LIMIT 5000").fetchall()
+        for comment_id, text, pain_label in rows:
+            sentiment, score, aspect = classify_sentiment(text)
+            conn.execute("""UPDATE comments SET sentiment=%s,sentiment_score=%s,aspect=%s,
+              classification_confidence=%s,review_status='machine_labeled' WHERE id=%s""",
+                         (sentiment, score, pain_label or aspect, score, comment_id))
+    return len(rows)
 
 
 def mark_source(config, status, rows=0, error=""):
@@ -407,6 +438,17 @@ def classify_pain(text):
     return "other"
 
 
+def classify_sentiment(text):
+    raw = str(text or "")
+    negative = len(SENTIMENT_RULES["negative"].findall(raw))
+    positive = len(SENTIMENT_RULES["positive"].findall(raw))
+    if negative and negative >= positive:
+        return "negative", max(0.55, min(0.98, 0.55 + negative * 0.08)), "keyword"
+    if positive:
+        return "positive", max(0.55, min(0.98, 0.55 + positive * 0.08)), "keyword"
+    return "unknown", 0.0, "other"
+
+
 def extract_url(item):
     value = first_value(item, ["url", "post_url", "video_url", "reel_url", "web_url", "permalink", "link", "source_url"])
     return str(value).strip() if value else ""
@@ -463,10 +505,12 @@ def collect_comments(opportunity_id, post_url, config):
                     continue
                 unique_url = comment_url or f"{post_url}#comment-{abs(hash(text))}"
                 published_at = source_datetime(first_value(item, ["published_at", "publish_time", "create_time", "created_time", "createTime", "timestamp", "posted_at", "comment_date", "date_posted", "date"]))
-                conn.execute("""INSERT INTO comments(opportunity_id,platform,comment_text,likes,replies,pain_label,comment_url,published_at)
-                  VALUES(%s,%s,%s,%s,%s,%s,%s,%s) ON CONFLICT (comment_url) DO UPDATE SET published_at=COALESCE(comments.published_at, EXCLUDED.published_at)""",
+                sentiment, sentiment_score, aspect = classify_sentiment(text)
+                conn.execute("""INSERT INTO comments(opportunity_id,platform,comment_text,likes,replies,pain_label,comment_url,published_at,sentiment,sentiment_score,aspect,classification_confidence,review_status,source_post_id)
+                  VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s) ON CONFLICT (comment_url) DO UPDATE SET published_at=COALESCE(comments.published_at, EXCLUDED.published_at), sentiment=EXCLUDED.sentiment, sentiment_score=EXCLUDED.sentiment_score, aspect=EXCLUDED.aspect, classification_confidence=EXCLUDED.classification_confidence""",
                   (opportunity_id, config["name"], text[:1000], safe_int(first_value(item, ["num_likes", "likes", "upvotes"])),
-                   safe_int(first_value(item, ["num_replies", "replies", "comments_count"])), classify_pain(text), unique_url, published_at))
+                   safe_int(first_value(item, ["num_replies", "replies", "comments_count"])), classify_pain(text), unique_url, published_at,
+                   sentiment, sentiment_score, aspect, sentiment_score, "machine_labeled", str(first_value(item, ["post_id", "video_id", "aweme_id"]) or "")[:120]))
             labels = conn.execute("""SELECT pain_label,count(*) FROM comments WHERE opportunity_id=%s
               GROUP BY pain_label ORDER BY count(*) DESC LIMIT 3""", (opportunity_id,)).fetchall()
             pain = "; ".join(f"{label} ({count})" for label, count in labels if label != "other")
@@ -492,6 +536,15 @@ def snapshot(category, market):
           ON CONFLICT (snapshot_date,market,category,platform) DO UPDATE SET opportunity_count=EXCLUDED.opportunity_count,
             avg_score=EXCLUDED.avg_score,avg_momentum=EXCLUDED.avg_momentum,avg_demand=EXCLUDED.avg_demand,
             comment_count=EXCLUDED.comment_count""", (market, category, market))
+
+
+def snapshot_pains(market):
+    with psycopg.connect(DB) as conn:
+        conn.execute("""INSERT INTO pain_snapshots(snapshot_date,market,platform,pain_label,sentiment,comment_count,total_comments)
+          SELECT CURRENT_DATE,o.market,c.platform,c.pain_label,c.sentiment,count(*),SUM(count(*)) OVER (PARTITION BY o.market,c.platform)
+          FROM comments c JOIN opportunities o ON o.id=c.opportunity_id
+          WHERE o.market=%s GROUP BY o.market,c.platform,c.pain_label,c.sentiment
+          ON CONFLICT(snapshot_date,market,platform,pain_label,sentiment) DO UPDATE SET comment_count=EXCLUDED.comment_count,total_comments=EXCLUDED.total_comments""", (market,))
 
 
 def run_platform(config, comment_budget):
@@ -567,6 +620,7 @@ def run_market(market):
     comment_budget = [MAX_COMMENT_POSTS]
     for slug in SOURCE_ORDER:
         comment_budget = run_platform(source_config(slug, market), comment_budget)
+    snapshot_pains(market)
 
 
 def run():
@@ -579,6 +633,7 @@ def run():
 def main():
     wait_for_db()
     ensure_worker_schema()
+    backfill_comment_classifications()
     while True:
         run()
         time.sleep(INTERVAL)
